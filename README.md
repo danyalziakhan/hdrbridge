@@ -139,7 +139,7 @@ frame does not need it. Turn it on for a game whose skies or glows arrive
 banded. The dither that hides the 8-bit steps changes every frame; Static
 Grain holds it still for anyone who sees it shimmer.
 
-![The HDR frame debanding and output settings](screenshots/debanding.png)
+![The output debanding settings, both areas open](screenshots/debanding.png)
 
 ### Protect HUD
 
@@ -210,7 +210,7 @@ effect:
 
 ![Compare: tone mapped on the left, the HDR frame clipped at SDR white on the right](screenshots/compare.png)
 
-![False color by nits, with its legend in the panel](screenshots/false-color-view.png)
+![False color by nits, the debug view](screenshots/false-color-view.png)
 
 The shader is `shaders\tonemap.hlsl`, laid out by `shaders\tonemap.manifest`,
 and both are built into the add-on. The same files run in
