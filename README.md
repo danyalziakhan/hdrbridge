@@ -76,6 +76,10 @@ yourself (see below).
    LoadFromDllMain=hdrbridge.addon64
    ```
 
+   With HUD Mask installed for Protect HUD, list both:
+   `LoadFromDllMain=hdrbridge.addon64,hudmask.addon64`. HUD Mask also needs a
+   `hudmask.cfg` listing the game's HUD shaders; its own README explains it.
+
 3. Start the game, set its window mode to fullscreen, and turn HDR on in its
    display settings, where the option should now be available.
 
@@ -139,7 +143,7 @@ Grain holds it still for anyone who sees it shimmer.
 
 ### Protect HUD
 
-With [HUD Mask](https://github.com/danyalziakhan/hudmask) installed, Protect HUD
+With [HUD Mask](https://github.com/danyalziakhan/hudmask) 0.3 or later installed, Protect HUD
 keeps the game's HUD steady. With Protect HUD off, the HUD rides the scene's
 exposure: in Odyssey, a fight in a ship full of black smoke brightens the
 exposure and the HUD with it. With it on, the HUD is tone mapped like

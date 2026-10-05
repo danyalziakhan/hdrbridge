@@ -340,8 +340,14 @@ static HRESULT STDMETHODCALLTYPE hook_CheckColorSpaceSupport(IDXGISwapChain3 *se
         *support = real_support | DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
         hr = S_OK;
     }
-    LOG("IDXGISwapChain3::CheckColorSpaceSupport(%d): real support 0x%X, returning 0x%X",
-        static_cast<int>(cs), real_support, support != nullptr ? *support : 0);
+    // Some games ask every frame, so each color space is logged when its
+    // answer changes.
+    static std::atomic<long long> logged[32];
+    const unsigned returned = support != nullptr ? *support : 0;
+    const long long answer = (static_cast<long long>(real_support) << 32 | returned) + 1;
+    const int i = static_cast<int>(cs);
+    if (i < 0 || i >= 32 || logged[i].exchange(answer) != answer)
+        LOG("IDXGISwapChain3::CheckColorSpaceSupport(%d): real support 0x%X, returning 0x%X", i, real_support, returned);
     return hr;
 }
 
@@ -370,8 +376,13 @@ static HRESULT STDMETHODCALLTYPE hook_SetColorSpace1(IDXGISwapChain3 *self, DXGI
     const DXGI_COLOR_SPACE_TYPE real_cs = real_label(cs);
     HRESULT hr = real_SetColorSpace1(self, real_cs);
     g_hdr10_label = static_cast<int>(real_cs);
-    LOG("IDXGISwapChain3::SetColorSpace1(%d)%s: real result 0x%08X", static_cast<int>(cs),
-        real_cs != cs ? ", labeled sRGB for Windows" : "", static_cast<unsigned>(hr));
+    // Logged when the color space, the label or the outcome changes, not on
+    // every call from a game that sets it each frame.
+    static std::atomic<long long> logged{-1};
+    const long long call = static_cast<long long>(cs) | static_cast<long long>(real_cs) << 16 | static_cast<long long>(FAILED(hr)) << 32;
+    if (logged.exchange(call) != call)
+        LOG("IDXGISwapChain3::SetColorSpace1(%d)%s: real result 0x%08X", static_cast<int>(cs),
+            real_cs != cs ? ", labeled sRGB for Windows" : "", static_cast<unsigned>(hr));
     if (FAILED(hr) && g_spoof_dxgi)
         hr = S_OK;
     return hr;
@@ -379,7 +390,7 @@ static HRESULT STDMETHODCALLTYPE hook_SetColorSpace1(IDXGISwapChain3 *self, DXGI
 
 // Borderless fullscreen. Some games that switch HDR on through NVAPI only
 // offer it in exclusive fullscreen. Alt+Tab ends exclusive mode: DXGI
-// minimises the window, the game falls back to windowed on its return, and
+// minimizes the window, the game falls back to windowed on its return, and
 // there it switches HDR off and marks it unavailable. So a
 // request for exclusive fullscreen is answered with a borderless window
 // covering the monitor instead, and the game is told it got what it asked
@@ -679,8 +690,11 @@ static NvAPI_Status __cdecl hook_GetHdrCapabilities(NvU32 displayId, NvHdrCapsHe
         return status;
 
     const NvU32 size = caps->version & 0xFFFF;
-    LOG("NvAPI_Disp_GetHdrCapabilities(display 0x%X, struct v%u, %u bytes): real status %d, real flags 0x%X",
-        displayId, caps->version >> 16, size, status, status == NVAPI_OK ? caps->flags : 0);
+    static std::atomic<int> calls{0};
+    const int n = ++calls;
+    if (n <= 5)
+        LOG("NvAPI_Disp_GetHdrCapabilities call %d (display 0x%X, struct v%u, %u bytes): real status %d, real flags 0x%X",
+            n, displayId, caps->version >> 16, size, status, status == NVAPI_OK ? caps->flags : 0);
 
     if (!g_spoof_nvapi || size < sizeof(NvHdrCapsHead))
         return status;
@@ -710,7 +724,9 @@ static NvAPI_Status __cdecl hook_HdrColorControl(NvU32 displayId, NvHdrColorHead
         // The driver rejects HDR on a display that cannot take it, and the
         // game then turns its HDR option off. Record the request and report
         // it back on GET; declare_scrgb does the part the driver would have.
-        LOG("NvAPI_Disp_HdrColorControl SET mode %u (struct v%u), accepted without forwarding", data->hdrMode, data->version >> 16);
+        static std::atomic<long long> logged_set{-1};
+        if (logged_set.exchange(data->hdrMode) != static_cast<long long>(data->hdrMode))
+            LOG("NvAPI_Disp_HdrColorControl SET mode %u (struct v%u), accepted without forwarding", data->hdrMode, data->version >> 16);
         std::lock_guard<std::mutex> lock(g_nv_mutex);
         std::memcpy(&g_nv_last_set, data, sizeof(NvHdrColorHead));
         g_nv_hdr_mode = static_cast<int>(data->hdrMode);
@@ -724,7 +740,10 @@ static NvAPI_Status __cdecl hook_HdrColorControl(NvU32 displayId, NvHdrColorHead
         if (g_nv_hdr_mode != 0 && size >= sizeof(NvHdrColorHead))
             std::memcpy(data->mastering, g_nv_last_set.mastering, sizeof(data->mastering));
     }
-    LOG("NvAPI_Disp_HdrColorControl GET: real status %d, reporting mode %u", status, data->hdrMode);
+    static std::atomic<long long> logged_get{-1};
+    const long long reply = static_cast<long long>(data->hdrMode) | static_cast<long long>(static_cast<unsigned>(status)) << 32;
+    if (logged_get.exchange(reply) != reply)
+        LOG("NvAPI_Disp_HdrColorControl GET: real status %d, reporting mode %u", status, data->hdrMode);
     return NVAPI_OK;
 }
 
@@ -1108,8 +1127,9 @@ static int g_listen_frame = 0;               // ImGui frame listening was last d
 static std::atomic<bool> g_capture_pending{false};
 static bool g_skip_capture = false;          // the press that set the key is not a capture
 
-// ReShade's own hotkeys, which cannot double as the capture key.
-static bool is_reshade_hotkey(int vk)
+// ReShade's own hotkeys, which cannot double as the capture key. Returns the
+// name of the one using this key, or null.
+static const char *is_reshade_hotkey(int vk)
 {
     for (const char *name : {"KeyOverlay", "KeyEffects", "KeyScreenshot", "KeyReload", "KeyNextPreset", "KeyPreviousPreset"})
     {
@@ -1117,9 +1137,9 @@ static bool is_reshade_hotkey(int vk)
         char text[64] = {};
         size_t size = sizeof(text);
         if (reshade::get_config_value(nullptr, "INPUT", name, text, &size) && atoi(text) == vk)
-            return true;
+            return name;
     }
-    return false;
+    return nullptr;
 }
 
 static std::string key_name(int vk)
@@ -1182,7 +1202,7 @@ static void draw_settings(effect_runtime *runtime)
             // Generic modifier codes duplicate their left and right forms.
             if (!runtime->is_key_pressed(vk) || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU)
                 continue;
-            if (vk != VK_ESCAPE && is_reshade_hotkey(vk))
+            if (vk != VK_ESCAPE && is_reshade_hotkey(vk) != nullptr)
                 continue;
             if (vk != VK_ESCAPE)
             {
@@ -1236,6 +1256,11 @@ static void on_reshade_present(effect_runtime *runtime)
 static DWORD WINAPI init_thread(LPVOID)
 {
     read_settings();
+    // Only a rebinding in the panel is checked against ReShade's keys, so a key
+    // from ReShade.ini, or the default, is checked here.
+    if (const char *clash = is_reshade_hotkey(g_capture_key))
+        WARN("the capture key, %s (0x%02X), is also ReShade's %s; one key press will do both",
+            key_name(g_capture_key).c_str(), g_capture_key.load(), clash);
     if (g_trace)
         trace_install();
     if (g_spoof_dxgi)
@@ -1282,7 +1307,7 @@ static DWORD WINAPI reregister_thread(LPVOID)
     // Thread start waits on the loader lock, so ReShade's DllMain has finished.
     // ReShade's header caches the module handle it found first, so this only
     // works when the reload lands at the same address. It does: an image's
-    // randomised base is fixed for the boot session, and the old one is free.
+    // randomized base is fixed for the boot session, and the old one is free.
     if (g_reshade_module != reshade::internal::get_reshade_module_handle())
         return 0;
     g_reshade_alive = true;

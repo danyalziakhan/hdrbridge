@@ -100,7 +100,6 @@ struct preset_def
 };
 
 std::vector<tex_def> g_texdefs;
-std::vector<int> g_sam_state;  // per texture slot, which sampler
 std::vector<samstate_def> g_samstates;
 std::vector<uni_def> g_unis;
 std::vector<pass_def> g_passes;
@@ -160,7 +159,6 @@ void parse_manifest(const std::string &text)
     std::istringstream in(text);
     std::string line;
     bool after = false;
-    std::map<std::string, int> sampler_of;
     while (std::getline(in, line))
     {
         if (!line.empty() && line.back() == '\r')
@@ -182,6 +180,8 @@ void parse_manifest(const std::string &text)
             t.blue_noise = source != "-";
             g_texdefs.push_back(t);
         }
+        // SAM lines, which texture uses which state, are not read: all three
+        // states are bound to every pass and the shader picks its register.
         else if (tag == "SAMSTATE")
         {
             int idx;
@@ -190,13 +190,6 @@ void parse_manifest(const std::string &text)
             if (int(g_samstates.size()) <= idx)
                 g_samstates.resize(idx + 1);
             g_samstates[idx] = {mn == "POINT", au == "WRAP"};
-        }
-        else if (tag == "SAM")
-        {
-            std::string sam, tex;
-            int state;
-            ls >> sam >> tex >> state;
-            sampler_of[tex] = state;
         }
         else if (tag == "UNI")
         {
@@ -319,8 +312,6 @@ void parse_manifest(const std::string &text)
             }
         }
     }
-    for (const tex_def &t : g_texdefs)
-        g_sam_state.push_back(sampler_of.count(t.name) ? sampler_of[t.name] : 0);
 }
 
 //----------------------------------------------------------------------------
@@ -421,6 +412,7 @@ void load_cfg()
     else
         LOG("reading %s, %d lines", path, int(lines.size()));
 
+    std::string applied;
     for (const std::string &l : lines)
         if (l.rfind("Preset=", 0) == 0)
         {
@@ -472,13 +464,16 @@ void load_cfg()
                      u->items.empty() ? double(u->lo) : 0.0,
                      u->items.empty() ? double(u->hi) : double(u->items.size() - 1), v);
             u->value = v;
-            LOG("%s=%g", key.c_str(), v);
+            char buf[96];
+            snprintf(buf, sizeof(buf), " %s=%g", key.c_str(), v);
+            applied += buf;
         }
         else
             WARN("%s in the settings file is not a setting, ignored", key.c_str());
     }
-    LOG("%s, preset %s%s", g_enabled ? "on" : "off (Enabled=0)",
-        g_presets.empty() ? "none" : g_presets[g_preset].name.c_str(), preset_edited() ? " with edits (Custom)" : "");
+    LOG("%s, preset %s%s%s%s", g_enabled ? "on" : "off (Enabled=0)",
+        g_presets.empty() ? "none" : g_presets[g_preset].name.c_str(), preset_edited() ? " with edits (Custom)" : "",
+        applied.empty() ? "" : ", from the file:", applied.c_str());
 }
 
 // Rewrites the settings and keeps the comments, which is where a preset author
@@ -634,7 +629,7 @@ void release_gpu(device *dev)
     }
     if (g_gpu.dummy.srv.handle) dev->destroy_resource_view(g_gpu.dummy.srv);
     for (const auto &[res, rtv] : g_gpu.back_rtvs)
-        dev->destroy_resource_view(rtv);
+        if (rtv.handle) dev->destroy_resource_view(rtv);
     for (const auto &[res, srv] : g_gpu.back_srvs)
         if (srv.handle) dev->destroy_resource_view(srv);
     if (g_gpu.dummy.res.handle) dev->destroy_resource(g_gpu.dummy.res);
@@ -820,6 +815,12 @@ bool build_gpu(device *dev, resource back_buffer, int color_space)
 // 3 is HDR10. Anything else is stored as 0 and the frame is left alone.
 int g_color_space = 0;
 effect_runtime *g_runtime = nullptr;
+// Every live runtime, and g_runtime's swap chain once one of its presents has
+// been recognized by its back buffers.
+std::vector<effect_runtime *> g_runtimes;
+swapchain *g_runtime_sc = nullptr;
+bool g_logged_other_sc = false;
+uint64_t g_present_count = 0;  // presents of g_runtime's swap chain, tone mapped or not
 
 // The conversion to SDR does not wait for ReShade's effect pass. ReShade skips
 // that pass while effects are loading, toggled off or absent, and the raw HDR
@@ -871,8 +872,102 @@ void note_skip(const char *why)
 
 void run_at_present(command_list *cmd, resource back_buffer, bool before, bool after);
 
+// The game's HUD texture, from the HUD Mask add-on when it is loaded. Its
+// export is found by name in whichever module carries it, so neither add-on
+// has to link against the other.
+using hud_frame_fn = int (*)(void *dev, uint64_t *srv);
+hud_frame_fn g_hud_fn = nullptr;
+uint64_t g_hud_next_lookup = 0;
+int g_hud_lookups = 0;
+enum class hud_mask { missing, too_old, found };
+hud_mask g_hud_mask = hud_mask::missing;
+// -1 when HUD Mask was not asked this frame, else its answer: 0 no HUD, 1 a
+// texture in g_hud_srv, 2 drawn onto the back buffer. The view is HUD Mask's
+// and only lives for this frame, so it is never kept past it.
+int g_hud_kind = -1;
+int g_hud_logged = 0;  // bit per kind already logged
+resource_view g_hud_srv = {0};
+
+// HUD Mask before 0.3 has no hudmask_frame_texture, but like every add-on it
+// exports NAME, a pointer to its name. The pointer is only followed into the
+// module's own image, since another module's NAME could be anything.
+bool is_old_hud_mask(HMODULE module)
+{
+    const auto name = reinterpret_cast<const char *const *>(GetProcAddress(module, "NAME"));
+    MODULEINFO info = {};
+    if (name == nullptr || !K32GetModuleInformation(GetCurrentProcess(), module, &info, sizeof(info)))
+        return false;
+    const char *const base = static_cast<const char *>(info.lpBaseOfDll);
+    const auto inside = [&](const void *p, size_t n) {
+        const char *c = static_cast<const char *>(p);
+        return c >= base && c + n <= base + info.SizeOfImage;
+    };
+    static const char wanted[] = "HUD Mask";
+    return inside(name, sizeof(*name)) && inside(*name, sizeof(wanted)) && std::memcmp(*name, wanted, sizeof(wanted)) == 0;
+}
+
+bool is_hdr(color_space cs)
+{
+    return cs == color_space::scrgb || cs == color_space::hdr10_pq;
+}
+
+// The runtime whose back buffers this swap chain presents, or null.
+effect_runtime *runtime_of(swapchain *sc)
+{
+    const uint64_t current = sc->get_current_back_buffer().handle;
+    for (effect_runtime *r : g_runtimes)
+        for (uint32_t i = 0; i < r->get_back_buffer_count(); ++i)
+            if (r->get_back_buffer(i).handle == current)
+                return r;
+    return nullptr;
+}
+
+// A game can present from a second swap chain in turn with its own, for a
+// splash screen or a video. The GPU resources fit one back buffer, so tone
+// mapping both would rebuild them on every present; only g_runtime's swap
+// chain is followed. Another runtime's swap chain takes over only when it is
+// in HDR and g_runtime's is not, or has not presented yet, so a runtime made
+// for a splash cannot leave the game's own HDR frame unconverted. A swap chain
+// no runtime claims is followed until g_runtime's own has been recognized,
+// which keeps the old behavior should back buffers ever fail to match.
+bool follow(swapchain *sc)
+{
+    if (g_runtime == nullptr || sc == g_runtime_sc)
+        return true;
+    effect_runtime *const owner = runtime_of(sc);
+    if (owner == g_runtime)
+    {
+        g_runtime_sc = sc;
+        return true;
+    }
+    if (owner == nullptr && g_runtime_sc == nullptr)
+        return true;
+    if (owner == nullptr || !is_hdr(sc->get_color_space()) ||
+        (g_runtime_sc != nullptr && is_hdr(g_runtime_sc->get_color_space())))
+    {
+        if (!g_logged_other_sc)
+        {
+            g_logged_other_sc = true;
+            LOG("a second swap chain is presenting too, and is left alone");
+        }
+        return false;
+    }
+    LOG("following another swap chain, which is in HDR while the one followed so far is not");
+    release_gpu(g_runtime->get_device());
+    g_runtime = owner;
+    g_runtime_sc = sc;
+    g_logged_other_sc = false;
+    return true;
+}
+
 void on_present(command_queue *queue, swapchain *sc, const rect *, const rect *, uint32_t, const rect *)
 {
+    if (!follow(sc))
+        return;
+    ++g_present_count;
+    // Not asked yet this frame; query_hud fills it in if the tone mapping runs.
+    g_hud_kind = -1;
+    g_hud_srv = {0};
     const int cs = static_cast<int>(sc->get_color_space());
     g_color_space = (cs == static_cast<int>(color_space::scrgb) || cs == static_cast<int>(color_space::hdr10_pq)) ? cs : 0;
     if (cs != g_last_color_space)
@@ -993,35 +1088,36 @@ bool setting_on(const std::string &name)
     return u == nullptr || u->value != 0.0;
 }
 
-// The game's HUD texture, from the HUD Mask add-on when it is loaded. Its
-// export is found by name in whichever module carries it, so neither add-on
-// has to link against the other.
-using hud_frame_fn = int (*)(void *dev, uint64_t *srv);
-hud_frame_fn g_hud_fn = nullptr;
-uint64_t g_hud_next_lookup = 0;
-// -1 without HUD Mask, else its answer for this frame: 0 no HUD, 1 a texture
-// in g_hud_srv, 2 drawn onto the back buffer. The view is HUD Mask's and only
-// lives for this frame, so it is never kept past it.
-int g_hud_kind = -1;
-int g_hud_logged = 0;  // bit per kind already logged
-resource_view g_hud_srv = {0};
-
 hud_frame_fn find_hud_mask()
 {
-    // Looked for at most every 120 frames while missing, since enumerating
-    // modules is not free and HUD Mask may load after this add-on.
-    if (g_hud_fn != nullptr || g_frame_count < g_hud_next_lookup)
+    // Looked for at most every 120 presents while missing, since enumerating
+    // modules is not free and HUD Mask may load after this add-on. It loads
+    // with ReShade, so ten tries are plenty.
+    if (g_hud_fn != nullptr || g_hud_lookups >= 10 || g_present_count < g_hud_next_lookup)
         return g_hud_fn;
-    g_hud_next_lookup = g_frame_count + 120;
+    g_hud_next_lookup = g_present_count + 120;
+    ++g_hud_lookups;
     HMODULE modules[1024];
     DWORD bytes = 0;
     if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
         return nullptr;
     const DWORD count = std::min<DWORD>(bytes / sizeof(HMODULE), DWORD(std::size(modules)));
+    bool too_old = false;
     for (DWORD i = 0; i < count && g_hud_fn == nullptr; ++i)
+    {
         g_hud_fn = reinterpret_cast<hud_frame_fn>(GetProcAddress(modules[i], "hudmask_frame_texture"));
+        too_old = too_old || (g_hud_fn == nullptr && is_old_hud_mask(modules[i]));
+    }
     if (g_hud_fn != nullptr)
+    {
+        g_hud_mask = hud_mask::found;
         LOG("found HUD Mask");
+    }
+    else if (too_old && g_hud_mask != hud_mask::too_old)
+    {
+        g_hud_mask = hud_mask::too_old;
+        WARN("HUD Mask is loaded but older than 0.3, which Protect HUD needs");
+    }
     return g_hud_fn;
 }
 
@@ -1476,7 +1572,7 @@ void set_frame_values()
 
 void on_finish_effects(effect_runtime *runtime, command_list *cmd, resource_view rtv, resource_view)
 {
-    if (!g_converted || g_output_done)
+    if (runtime != g_runtime || !g_converted || g_output_done)
         return;
     const cpu_timer timer;
     const resource back_buffer = runtime->get_device()->get_resource_from_view(rtv);
@@ -1493,7 +1589,7 @@ void on_finish_effects(effect_runtime *runtime, command_list *cmd, resource_view
 // overlay is already drawn by then, so a loading bar comes out a little dim.
 void on_reshade_present(effect_runtime *runtime)
 {
-    if (!g_converted || g_output_done)
+    if (runtime != g_runtime || !g_converted || g_output_done)
         return;
     run_at_present(runtime->get_command_queue()->get_immediate_command_list(), runtime->get_current_back_buffer(), false, true);
     if (g_output_done)
@@ -1502,16 +1598,35 @@ void on_reshade_present(effect_runtime *runtime)
 
 void on_init_effect_runtime(effect_runtime *runtime)
 {
+    if (std::find(g_runtimes.begin(), g_runtimes.end(), runtime) == g_runtimes.end())
+        g_runtimes.push_back(runtime);
+    // A runtime for a splash or video swap chain does not take over from a
+    // swap chain already showing HDR.
+    if (g_runtime != nullptr && runtime != g_runtime && g_runtime_sc != nullptr && is_hdr(g_runtime_sc->get_color_space()))
+    {
+        LOG("ReShade effect runtime created for a second swap chain");
+        return;
+    }
     g_runtime = runtime;
+    g_runtime_sc = nullptr;
     LOG("ReShade effect runtime created");
 }
 
 void on_destroy_effect_runtime(effect_runtime *runtime)
 {
     LOG("ReShade effect runtime destroyed");
-    release_gpu(runtime->get_device());
+    // The resources were made on g_runtime's device, and only that one can
+    // release them.
+    if (g_runtime == nullptr || runtime->get_device() == g_runtime->get_device())
+        release_gpu(runtime->get_device());
+    g_runtimes.erase(std::remove(g_runtimes.begin(), g_runtimes.end(), runtime), g_runtimes.end());
     if (runtime == g_runtime)
-        g_runtime = nullptr;
+    {
+        // Another swap chain's runtime, if one is left, so its frames are not
+        // left unconverted.
+        g_runtime = g_runtimes.empty() ? nullptr : g_runtimes.back();
+        g_runtime_sc = nullptr;
+    }
 }
 
 // D3D11's immediate context is the game's own, and outside ReShade's pass
@@ -1596,7 +1711,12 @@ void run_at_present(command_list *cmd, resource back_buffer, bool before, bool a
     if (!prepare(g_runtime, back_buffer))
         return;
     device *const dev = cmd->get_device();
-    resource_view &rtv = g_gpu.back_rtvs[back_buffer.handle];
+    // A failed view stays in the map as a null handle, so it is tried and
+    // warned about once per back buffer until the resources are rebuilt.
+    const auto [it, first] = g_gpu.back_rtvs.try_emplace(back_buffer.handle);
+    resource_view &rtv = it->second;
+    if (rtv.handle == 0 && !first)
+        return;
     if (rtv.handle == 0)
     {
         const resource_desc bb = dev->get_resource_desc(back_buffer);
@@ -1707,6 +1827,8 @@ bool tonemap_outputs_srgb()
 void tonemap_forget()
 {
     g_runtime = nullptr;
+    g_runtimes.clear();
+    g_runtime_sc = nullptr;
     for (pass_def &p : g_passes)
         p.pipe = {0};
     g_gpu = gpu_state();
@@ -1714,6 +1836,8 @@ void tonemap_forget()
     // up again rather than called through a pointer into an unloaded module.
     g_hud_fn = nullptr;
     g_hud_next_lookup = 0;
+    g_hud_lookups = 0;
+    g_hud_mask = hud_mask::missing;
     g_hud_kind = -1;
     g_hud_logged = 0;
     g_hud_srv = {0};
@@ -2208,7 +2332,12 @@ static void draw_window(effect_runtime *)
         // Protect HUD has nothing to work with until HUD Mask supplies a texture.
         const bool hud = category == "HUD";
         if (hud)
-            ImGui::BeginDisabled(g_hud_kind == -1 || g_hud_kind == 2);
+        {
+            // Looked up from here too, so the line below is right while the
+            // game is not in HDR and the stages do not run.
+            find_hud_mask();
+            ImGui::BeginDisabled(g_hud_mask != hud_mask::found || g_hud_kind == 2);
+        }
         bool any_advanced = false;
         std::vector<std::string> groups;
         for (uni_def &u : g_unis)
@@ -2259,7 +2388,9 @@ static void draw_window(effect_runtime *)
         if (hud)
         {
             ImGui::EndDisabled();
-            ImGui::TextDisabled("%s", g_hud_kind == -1 ? "HUD Mask is not installed."
+            ImGui::TextDisabled("%s", g_hud_mask == hud_mask::missing ? "HUD Mask is not installed."
+                                    : g_hud_mask == hud_mask::too_old ? "Protect HUD needs HUD Mask 0.3 or later."
+                                    : g_hud_kind == -1 ? "HUD Mask is installed."
                                     : g_hud_kind == 1 ? "HUD Mask is supplying the game's HUD texture."
                                     : g_hud_kind == 2 ? "This game draws its HUD onto the back buffer, which Protect HUD cannot use."
                                     : "HUD Mask is installed but has no HUD this frame, or is switched off.");

@@ -6,8 +6,8 @@ TONEMAP_MANIFEST RCDATA "../shaders/tonemap.manifest"
 TONEMAP_NOISE    RCDATA "../shaders/bluenoise_512x256.rgba"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,0,0
-PRODUCTVERSION  0,1,0,0
+FILEVERSION     0,2,0,0
+PRODUCTVERSION  0,2,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -20,12 +20,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Danyal Zia Khan"
             VALUE "FileDescription",  "HDR Bridge, a ReShade add-on"
-            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "FileVersion",      "0.2.0.0"
             VALUE "InternalName",     "hdrbridge"
             VALUE "LegalCopyright",   "Copyright (c) 2026 Danyal Zia Khan"
             VALUE "OriginalFilename", "hdrbridge.addon64"
             VALUE "ProductName",      "HDR Bridge"
-            VALUE "ProductVersion",   "0.1"
+            VALUE "ProductVersion",   "0.2"
         END
     END
     BLOCK "VarFileInfo"

@@ -262,7 +262,7 @@ TIP DitherStrength Dither amplitude in 8-bit steps. 1.0 is what the math asks fo
 UI ProtectHud check 0 1 0.01
 LABEL ProtectHud Protect HUD
 CATEGORY ProtectHud HUD
-TIP ProtectHud Keeps the game's HUD steady. It is tone mapped at a fixed exposure, set by Exposure\nand HUD Brightness, rather than following the scene, and gets no debanding or dither. It is also\nleft out of the metering, except in full-screen menus. Effects still apply. Needs HUD Mask.
+TIP ProtectHud Keeps the game's HUD steady. It is tone mapped at a fixed exposure, set by Exposure\nand HUD Brightness, rather than following the scene, and gets no debanding or dither. It is also\nleft out of the metering, except in full-screen menus. Effects still apply. Needs HUD Mask 0.3 or later.
 UI HudBrightness slider -2.0 2.0 0.05
 LABEL HudBrightness HUD Brightness
 CATEGORY HudBrightness HUD

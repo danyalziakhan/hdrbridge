@@ -30,18 +30,11 @@ float ToPixels(float authored)
 // :: Source Color Space :: |
 //---------------------------|
 
-// 2 is scRGB: linear, BT.709 primaries, 1.0 = 80 nits, in a half float swap
-// chain. 3 is HDR10: PQ and BT.2020 in a 10-bit one. Anything else, SDR above
-// all, passes straight through, so the effect can stay switched on in a game
-// that is not in HDR.
+// The add-on compiles this for the game's swap chain: 2 is scRGB, linear with
+// BT.709 primaries and 1.0 = 80 nits in a half float swap chain, and 3 is
+// HDR10, PQ and BT.2020 in a 10-bit one. It does not run on an SDR one.
 #ifndef BUFFER_COLOR_SPACE
-    #define BUFFER_COLOR_SPACE 1
-#endif
-
-#if BUFFER_COLOR_SPACE == 2 || BUFFER_COLOR_SPACE == 3
-    #define TONEMAP_ACTIVE 1
-#else
-    #define TONEMAP_ACTIVE 0
+    #define BUFFER_COLOR_SPACE 2
 #endif
 
 Texture2D sTexColor_t : register(t0);
@@ -218,7 +211,6 @@ float3 LinearToSrgb(float3 c)
                   c.b <= 0.0031308 ? lo.b : hi.b);
 }
 
-#if TONEMAP_ACTIVE
 // SMPTE ST 2084, nits to signal and back.
 float PqEncode(float nits)
 {
@@ -300,11 +292,12 @@ float3 CompressGamut(float3 c)
 }
 
 // ITU-R BT.2390 EETF: maps [0, src_peak] onto [0, dst_peak], both in nits. In
-// PQ, where steps are perceptually even, it is the identity up to a knee at
-// 1.5 * target - 0.5 of the source range and a Hermite spline above that,
-// arriving at the target peak with zero slope. Anything above the source peak
-// clips there. With the target at or above the source the knee sits past the
-// top, so a dim scene passes through at its own brightness.
+// PQ, where steps are perceptually even, it is the identity up to a knee and a
+// Hermite spline above that, arriving at the target peak with zero slope. At
+// the default Highlight Compression the knee is at 1.5 * target - 0.5 of the
+// source range. Anything above the source peak clips there. With the target at
+// or above the source the knee sits past the top, so a dim scene passes
+// through at its own brightness.
 float Bt2390(float nits, float src_peak, float dst_peak)
 {
     float src_e  = PqEncode(src_peak);
@@ -726,13 +719,11 @@ float3 DrawMeter(float2 uv, float3 c)
     }
     return col;
 }
-#endif
 
 //---------------------|
 // :: Pixel Shaders :: |
 //---------------------|
 
-#if TONEMAP_ACTIVE
 // Decode once, and replace an invalid pixel with the mean of its valid direct
 // neighbors, or black when none of them is valid either.
 float4 PS_Source(VS_OUTPUT input) : SV_Target
@@ -1178,9 +1169,3 @@ float4 PS_Output(VS_OUTPUT input) : SV_Target
     return float4(c, 1.0);
 #endif
 }
-#else
-float4 PS_Passthrough(VS_OUTPUT input) : SV_Target
-{
-    return tex2D(sTexColor, input.uv);
-}
-#endif
