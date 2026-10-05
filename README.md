@@ -120,7 +120,7 @@ The Preset list at the top of Tone Mapping sets them all at once:
 Moving any setting under it shows Custom, and its reset button goes back to the
 preset's value. Picking a preset again puts all of its values back.
 
-![Display White moved, so the preset shows Custom and the setting has a reset button](screenshots/custom.png)
+![Advanced open, with settings moved from the preset so it shows Custom and each has a reset button](screenshots/advanced.png)
 
 Vivid shows any steps the HDR frame carries in a bright gradient as colored
 rings, where Standard compresses them away with the rest of the highlight. A
@@ -167,6 +167,8 @@ HUD on the back buffer rather than in a texture of its own: there the mask is
 only built after the frame has already been tone mapped. The line under it says
 which applies. Debug View has a HUD coverage view for checking the mask.
 
+![Protect HUD on, with HUD Mask supplying the game's HUD texture](screenshots/hud.png)
+
 Changes apply at once and are saved to `hdrbridge.cfg` next to the add-on, one
 file per game. It is plain text, `Name=value` per line with `#` for comments.
 `Preset` names the preset, and the lines after it are only what was changed
@@ -202,7 +204,13 @@ effect:
   of the pixel under the cursor.
 - The swap chain's format, the color space the game asked for and what
   Windows is told, the display luminance reported to the game, and the GPU
-  time of each stage.
+  time of each pass.
+
+![The histogram and the GPU time of each pass](screenshots/developer.png)
+
+![Compare: tone mapped on the left, the HDR frame clipped at SDR white on the right](screenshots/compare.png)
+
+![False color by nits, with its legend in the panel](screenshots/false-color-view.png)
 
 The shader is `shaders\tonemap.hlsl`, laid out by `shaders\tonemap.manifest`,
 and both are built into the add-on. The same files run in
