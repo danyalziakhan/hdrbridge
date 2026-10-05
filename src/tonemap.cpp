@@ -10,6 +10,7 @@
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <psapi.h>
 #define ImTextureID ImU64
 #include <imgui.h>
 #include <reshade.hpp>
@@ -58,6 +59,8 @@ struct tex_def
     std::string width, height, levels;  // numbers, or W, H and METER
     format fmt = format::unknown;
     bool blue_noise = false;
+    bool hud = false;     // HUD Mask's view of the game's HUD, bound per frame
+    std::string mips_if;  // mips generated only while this setting is on
 };
 
 struct uni_def
@@ -67,15 +70,22 @@ struct uni_def
     double value = 0.0, fallback = 0.0;
     int offset = 0;
     // How the overlay shows it
-    std::string widget, label, category, tip;
+    std::string widget, label, category, tip, unit;
     float lo = 0.0f, hi = 1.0f, step = 0.01f;
     std::vector<std::string> items;
+    std::string group;       // folded under this name inside its section
+    bool advanced = false;   // drawn under Advanced in its section
+    bool no_preset = false;  // a game setting a preset leaves alone
 };
 
 struct pass_def
 {
     std::string name, ps, target;
+    bool has_target2 = false;
+    std::string target2;  // written as SV_Target1; empty, like target, for the back buffer
     bool after = false;
+    std::string run_if;  // pass run only while this setting is on
+    bool run_if_off = false;  // or, written !Setting, only while it is off
     pipeline pipe = {0};
 };
 
@@ -130,6 +140,14 @@ uni_def *find_uni(const std::string &name)
     return nullptr;
 }
 
+int tex_index(const char *name)
+{
+    for (size_t i = 0; i < g_texdefs.size(); ++i)
+        if (g_texdefs[i].name == name)
+            return int(i);
+    return -1;
+}
+
 std::string unescape(std::string s)
 {
     for (size_t i = 0; (i = s.find("\\n", i)) != std::string::npos;)
@@ -159,6 +177,7 @@ void parse_manifest(const std::string &text)
             std::string kind, fmt, source;
             ls >> t.name >> kind >> t.width >> t.height >> fmt >> t.levels >> source;
             t.back_buffer = kind == "BACKBUFFER";
+            t.hud = kind == "HUD";
             t.fmt = format_from(fmt);
             t.blue_noise = source != "-";
             g_texdefs.push_back(t);
@@ -201,6 +220,12 @@ void parse_manifest(const std::string &text)
             ls >> p.name >> vs >> p.ps >> p.target;
             if (p.target == "-")
                 p.target.clear();
+            if (ls >> p.target2)
+            {
+                p.has_target2 = true;
+                if (p.target2 == "-")
+                    p.target2.clear();
+            }
             p.after = after;
             g_passes.push_back(p);
         }
@@ -210,6 +235,46 @@ void parse_manifest(const std::string &text)
             ls >> name;
             if (uni_def *u = find_uni(name))
                 ls >> u->widget >> u->lo >> u->hi >> u->step;
+        }
+        else if (tag == "SKIPIF" || tag == "MIPSIF")
+        {
+            std::string name, setting;
+            ls >> name >> setting;
+            if (tag == "SKIPIF")
+            {
+                const bool off = !setting.empty() && setting[0] == '!';
+                for (pass_def &p : g_passes)
+                    if (p.name == name)
+                    {
+                        p.run_if = off ? setting.substr(1) : setting;
+                        p.run_if_off = off;
+                    }
+            }
+            else
+            {
+                for (tex_def &t : g_texdefs)
+                    if (t.name == name)
+                        t.mips_if = setting;
+            }
+        }
+        else if (tag == "ADVANCED" || tag == "NOPRESET")
+        {
+            if (uni_def *u = find_uni(rest))
+                (tag == "ADVANCED" ? u->advanced : u->no_preset) = true;
+        }
+        else if (tag == "GROUP")
+        {
+            const size_t sp = rest.find(' ');
+            if (sp != std::string::npos)
+                if (uni_def *u = find_uni(rest.substr(0, sp)))
+                    u->group = rest.substr(sp + 1);
+        }
+        else if (tag == "UNIT")
+        {
+            const size_t sp = rest.find(' ');
+            if (sp != std::string::npos)
+                if (uni_def *u = find_uni(rest.substr(0, sp)))
+                    u->unit = rest.substr(sp + 1);
         }
         else if (tag == "PRESETCATEGORY")
         {
@@ -269,7 +334,7 @@ bool same(double a, double b)
 
 bool in_preset(const uni_def &u)
 {
-    return !g_presets.empty() && u.category == g_preset_category;
+    return !g_presets.empty() && u.category == g_preset_category && !u.no_preset;
 }
 
 double preset_value(int p, const uni_def &u)
@@ -387,7 +452,16 @@ void load_cfg()
         {
             // Held to what the panel can set, so a hand edited file cannot ask
             // for something the slider would never reach.
-            const double asked = atof(l.c_str() + eq + 1);
+            const char *text = l.c_str() + eq + 1;
+            char *end = nullptr;
+            const double asked = std::strtod(text, &end);
+            while (end != nullptr && (*end == ' ' || *end == '\t'))
+                ++end;
+            if (end == text || end == nullptr || *end != '\0' || !std::isfinite(asked))
+            {
+                WARN("%s=%s is not a number, keeping %g", key.c_str(), l.c_str() + eq + 1, u->value);
+                continue;
+            }
             double v = asked;
             if (!u->items.empty())
                 v = std::clamp(v, 0.0, double(u->items.size() - 1));
@@ -450,6 +524,34 @@ struct texture
     format fmt = format::unknown;
 };
 
+// The panel's readouts: timestamps around both stages, and small copies of
+// the frame statistics, a probed pixel and a reduced frame for the histogram.
+// Each frame uses one of a few slots and reads back the slot it is about to
+// reuse, several frames old, so the CPU never waits on the GPU. All optional:
+// without them the panel shows less and nothing else changes.
+constexpr uint32_t kSlots = 4;
+
+// Timestamp layout within one slot: the tone map stage's start and the end
+// of its copy, the output stage's start and the end of its copy, and one mark
+// after each pass, in manifest order.
+uint32_t before_pass_count();
+uint32_t ts_per_slot();
+uint32_t ts_after_start();
+uint32_t ts_of_pass(size_t pass);
+
+struct monitor
+{
+    query_heap queries = {0};
+    uint64_t frequency = 0;
+    resource stats[kSlots] = {};
+    resource probe_hdr[kSlots] = {}, probe_sdr[kSlots] = {};
+    resource hist = {0};
+    uint32_t hist_w = 0, hist_h = 0, hist_mip = 0;
+    uint64_t hist_frame = 0;
+    bool hist_pending = false;
+    bool timed_before[kSlots] = {}, timed_after[kSlots] = {}, copied[kSlots] = {}, probed[kSlots] = {};
+};
+
 struct gpu_state
 {
     uint32_t width = 0, height = 0;
@@ -458,8 +560,12 @@ struct gpu_state
     std::vector<texture> textures;  // manifest order; the back buffer copy is a texture too
     texture dummy;                  // stands in for a pass's own target among its inputs
     std::map<uint64_t, resource_view> back_rtvs;  // for running without ReShade's pass
+    // Shader views of the back buffers themselves. A null view means the swap
+    // chain does not allow one, and the frame is copied instead.
+    std::map<uint64_t, resource_view> back_srvs;
     sampler samplers[3] = {};
     pipeline_layout layout = {0};
+    monitor mon;
     bool ready = false;
     bool failed = false;
 };
@@ -514,6 +620,8 @@ bool compile(const std::string &entry, const char *target, const std::vector<std
     return true;
 }
 
+void publish_output();
+
 void release_gpu(device *dev)
 {
     if (g_gpu.ready)
@@ -527,6 +635,8 @@ void release_gpu(device *dev)
     if (g_gpu.dummy.srv.handle) dev->destroy_resource_view(g_gpu.dummy.srv);
     for (const auto &[res, rtv] : g_gpu.back_rtvs)
         dev->destroy_resource_view(rtv);
+    for (const auto &[res, srv] : g_gpu.back_srvs)
+        if (srv.handle) dev->destroy_resource_view(srv);
     if (g_gpu.dummy.res.handle) dev->destroy_resource(g_gpu.dummy.res);
     for (sampler s : g_gpu.samplers)
         if (s.handle) dev->destroy_sampler(s);
@@ -536,7 +646,14 @@ void release_gpu(device *dev)
         p.pipe = {0};
     }
     if (g_gpu.layout.handle) dev->destroy_pipeline_layout(g_gpu.layout);
+    monitor &m = g_gpu.mon;
+    if (m.queries.handle) dev->destroy_query_heap(m.queries);
+    for (uint32_t s = 0; s < kSlots; ++s)
+        for (resource r : {m.stats[s], m.probe_hdr[s], m.probe_sdr[s]})
+            if (r.handle) dev->destroy_resource(r);
+    if (m.hist.handle) dev->destroy_resource(m.hist);
     g_gpu = gpu_state();
+    publish_output();
 }
 
 bool make_texture(device *dev, texture &t, uint32_t w, uint32_t h, uint32_t levels, format fmt, bool target,
@@ -595,6 +712,13 @@ bool build_gpu(device *dev, resource back_buffer, int color_space)
             ok = dev->create_resource(desc, nullptr, resource_usage::shader_resource, &t.res) &&
                  dev->create_resource_view(t.res, resource_usage::shader_resource, resource_view_desc(back_typed), &t.srv);
         }
+        else if (d.hud)
+        {
+            // A blank stand-in, alpha 0, for frames without a HUD texture.
+            std::vector<uint8_t> blank(4, 0);
+            subresource_data data = {blank.data(), 4, 0};
+            ok = make_texture(dev, t, 1, 1, 1, format::r8g8b8a8_unorm, false, &data);
+        }
         else if (d.blue_noise)
         {
             subresource_data data = {g_blue_noise.data(), 512 * 4, 0};
@@ -638,10 +762,14 @@ bool build_gpu(device *dev, resource back_buffer, int color_space)
         std::vector<uint8_t> ps;
         if (!compile(p.ps, "ps_5_0", defs, ps))
             return false;
-        format rt_format = back_typed;
+        format rt_formats[2] = {back_typed, back_typed};
         for (size_t i = 0; i < g_texdefs.size(); ++i)
+        {
             if (g_texdefs[i].name == p.target)
-                rt_format = g.textures[i].fmt;
+                rt_formats[0] = g.textures[i].fmt;
+            if (p.has_target2 && g_texdefs[i].name == p.target2)
+                rt_formats[1] = g.textures[i].fmt;
+        }
         shader_desc vs_desc = {vs.data(), vs.size()};
         shader_desc ps_desc = {ps.data(), ps.size()};
         primitive_topology topology = primitive_topology::triangle_list;
@@ -652,13 +780,36 @@ bool build_gpu(device *dev, resource back_buffer, int color_space)
         pipeline_subobject subobjects[] = {
             {pipeline_subobject_type::vertex_shader, 1, &vs_desc},
             {pipeline_subobject_type::pixel_shader, 1, &ps_desc},
-            {pipeline_subobject_type::render_target_formats, 1, &rt_format},
+            {pipeline_subobject_type::render_target_formats, p.has_target2 ? 2u : 1u, rt_formats},
             {pipeline_subobject_type::primitive_topology, 1, &topology},
             {pipeline_subobject_type::rasterizer_state, 1, &rasterizer},
             {pipeline_subobject_type::depth_stencil_state, 1, &depth},
         };
         if (!dev->create_pipeline(g.layout, uint32_t(std::size(subobjects)), subobjects, &p.pipe))
             return false;
+    }
+
+    monitor &m = g.mon;
+    dev->create_query_heap(query_type::timestamp, kSlots * ts_per_slot(), &m.queries);
+    auto readback = [dev](uint32_t w, uint32_t h, format fmt, resource &out) {
+        dev->create_resource(resource_desc(w, h, 1, 1, fmt, 1, memory_heap::readback, resource_usage::copy_dest),
+                             nullptr, resource_usage::copy_dest, &out);
+    };
+    const int stats_i = tex_index("TexStats"), hdr_i = tex_index("TexHdr"), proxy_i = tex_index("TexProxy"), meter_i = tex_index("TexMeter");
+    for (uint32_t s = 0; s < kSlots; ++s)
+    {
+        if (stats_i >= 0) readback(1, 1, g.textures[stats_i].fmt, m.stats[s]);
+        if (hdr_i >= 0) readback(1, 1, g.textures[hdr_i].fmt, m.probe_hdr[s]);
+        if (proxy_i >= 0) readback(1, 1, g.textures[proxy_i].fmt, m.probe_sdr[s]);
+    }
+    // A quarter of the frame each way, block averaged by the meter's mips: plenty
+    // for a histogram, and a fraction of a full frame to copy.
+    if (meter_i >= 0 && g.textures[meter_i].levels > 2)
+    {
+        m.hist_mip = 2;
+        m.hist_w = std::max(1u, g.textures[meter_i].width >> 2);
+        m.hist_h = std::max(1u, g.textures[meter_i].height >> 2);
+        readback(m.hist_w, m.hist_h, g.textures[meter_i].fmt, m.hist);
     }
     g.ready = true;
     return true;
@@ -677,6 +828,16 @@ effect_runtime *g_runtime = nullptr;
 // ends up: after the effects when they ran, otherwise at the end of present.
 bool g_converted = false;
 bool g_output_done = false;
+
+// Whether the frame leaving the swap chain is sRGB, read from the game's own
+// thread when it labels its swap chain. Published wherever one of its inputs
+// changes rather than read from g_gpu, which the render thread rebuilds.
+std::atomic<bool> g_outputs_srgb{false};
+
+void publish_output()
+{
+    g_outputs_srgb = g_enabled && g_gpu.ready;
+}
 
 // Where the last frame's output stage ran, and why a frame was left alone, so
 // each change is logged once.
@@ -774,8 +935,11 @@ bool prepare(effect_runtime *runtime, resource back_buffer)
         log_error("HDR Bridge could not set up tone mapping");
         return false;
     }
+    if (g_gpu.mon.queries.handle)
+        g_gpu.mon.frequency = runtime->get_command_queue()->get_timestamp_frequency();
     LOG("set up for %ux%u, back buffer format %u, %s, %d passes", bb.texture.width, bb.texture.height,
         static_cast<unsigned>(bb.texture.format), cs == 2 ? "scRGB" : "HDR10", int(g_passes.size()));
+    publish_output();
     return true;
 }
 
@@ -792,6 +956,104 @@ void copy_back_buffer(command_list *cmd, resource back_buffer)
     cmd->barrier(2, res, before, during);
     cmd->copy_resource(back_buffer, copy.res);
     cmd->barrier(2, res, during, before);
+}
+
+// While the tone map stage reads the back buffer in place: the buffer, its
+// view, and whether it is still in the shader resource state.
+resource g_direct_back = {0};
+resource_view g_direct_back_srv = {0};
+bool g_back_readable = false;
+
+// The back buffer can be read in place when the swap chain allows shader
+// access, which saves the copy. The output stage still copies, since it
+// writes the buffer it reads.
+resource_view direct_back_view(device *dev, resource back_buffer)
+{
+    const auto it = g_gpu.back_srvs.find(back_buffer.handle);
+    if (it != g_gpu.back_srvs.end())
+        return it->second;
+    resource_view srv = {0};
+    const resource_desc bb = dev->get_resource_desc(back_buffer);
+    if (static_cast<uint32_t>(bb.usage & resource_usage::shader_resource) != 0 &&
+        !dev->create_resource_view(back_buffer, resource_usage::shader_resource,
+                                   resource_view_desc(format_to_default_typed(bb.texture.format, 0)), &srv))
+        srv = {0};
+    if (g_gpu.back_srvs.empty())
+        LOG("%s", srv.handle != 0 ? "reading the back buffer in place, no copy needed"
+                                  : "copying the back buffer, since the swap chain does not allow reading it in place");
+    g_gpu.back_srvs[back_buffer.handle] = srv;
+    return srv;
+}
+
+void mark_time(command_list *cmd, uint32_t index);
+
+bool setting_on(const std::string &name)
+{
+    const uni_def *u = find_uni(name);
+    return u == nullptr || u->value != 0.0;
+}
+
+// The game's HUD texture, from the HUD Mask add-on when it is loaded. Its
+// export is found by name in whichever module carries it, so neither add-on
+// has to link against the other.
+using hud_frame_fn = int (*)(void *dev, uint64_t *srv);
+hud_frame_fn g_hud_fn = nullptr;
+uint64_t g_hud_next_lookup = 0;
+// -1 without HUD Mask, else its answer for this frame: 0 no HUD, 1 a texture
+// in g_hud_srv, 2 drawn onto the back buffer. The view is HUD Mask's and only
+// lives for this frame, so it is never kept past it.
+int g_hud_kind = -1;
+int g_hud_logged = 0;  // bit per kind already logged
+resource_view g_hud_srv = {0};
+
+hud_frame_fn find_hud_mask()
+{
+    // Looked for at most every 120 frames while missing, since enumerating
+    // modules is not free and HUD Mask may load after this add-on.
+    if (g_hud_fn != nullptr || g_frame_count < g_hud_next_lookup)
+        return g_hud_fn;
+    g_hud_next_lookup = g_frame_count + 120;
+    HMODULE modules[1024];
+    DWORD bytes = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+        return nullptr;
+    const DWORD count = std::min<DWORD>(bytes / sizeof(HMODULE), DWORD(std::size(modules)));
+    for (DWORD i = 0; i < count && g_hud_fn == nullptr; ++i)
+        g_hud_fn = reinterpret_cast<hud_frame_fn>(GetProcAddress(modules[i], "hudmask_frame_texture"));
+    if (g_hud_fn != nullptr)
+        LOG("found HUD Mask");
+    return g_hud_fn;
+}
+
+// Asks HUD Mask for this frame's HUD once, before the tone map stage. The two
+// flags it sets also hold for the output stage of the same frame.
+void query_hud(device *dev)
+{
+    g_hud_kind = -1;
+    g_hud_srv = {0};
+    if (const hud_frame_fn fn = find_hud_mask())
+    {
+        uint64_t srv = 0;
+        const int kind = fn(dev, &srv);
+        // A texture answer without a view is no use, so it counts as no HUD.
+        g_hud_kind = kind == 1 && srv != 0 ? 1 : kind == 2 ? 2 : 0;
+        if (g_hud_kind == 1)
+            g_hud_srv = {srv};
+    }
+    // Each answer is logged the first time only: some games skip the HUD on
+    // alternate frames, and logging every change would flood the log.
+    if (g_hud_kind > 0 && (g_hud_logged & (1 << g_hud_kind)) == 0)
+    {
+        g_hud_logged |= 1 << g_hud_kind;
+        LOG("HUD Mask: %s", g_hud_kind == 1 ? "using the game's HUD texture"
+                                            : "the HUD is drawn onto the back buffer, which Protect HUD cannot use");
+    }
+    const bool available = g_hud_kind == 1;
+    const uni_def *protect = find_uni("ProtectHud");
+    if (uni_def *u = find_uni("HudAvailable"))
+        u->value = available ? 1.0 : 0.0;
+    if (uni_def *u = find_uni("HudActive"))
+        u->value = available && protect != nullptr && protect->value != 0.0 ? 1.0 : 0.0;
 }
 
 void run_stage(command_list *cmd, bool after, resource_view back_rtv)
@@ -814,34 +1076,65 @@ void run_stage(command_list *cmd, bool after, resource_view back_rtv)
         }
     }
 
-    for (const pass_def &p : g_passes)
+    for (size_t pi = 0; pi < g_passes.size(); ++pi)
     {
+        const pass_def &p = g_passes[pi];
         if (p.after != after)
             continue;
-        int target = -1;
-        for (size_t i = 0; i < g_texdefs.size(); ++i)
-            if (g_texdefs[i].name == p.target)
-                target = int(i);
-
-        resource_view rtv = back_rtv;
-        uint32_t w = g.width, h = g.height;
-        if (target >= 0)
+        if (!p.run_if.empty() && setting_on(p.run_if) == p.run_if_off)
         {
-            const texture &t = g.textures[target];
-            rtv = t.rtv;
-            w = t.width;
-            h = t.height;
+            mark_time(cmd, ts_of_pass(pi));
+            continue;
+        }
+        auto tex_of = [](const std::string &name) {
+            int found = -1;
+            for (size_t i = 0; i < g_texdefs.size(); ++i)
+                if (g_texdefs[i].name == name)
+                    found = int(i);
+            return found;
+        };
+        const int targets[2] = {tex_of(p.target), p.has_target2 ? tex_of(p.target2) : -1};
+        const uint32_t target_count = p.has_target2 ? 2 : 1;
+
+        resource_view rtvs[2] = {back_rtv, back_rtv};
+        uint32_t w = g.width, h = g.height;
+        for (uint32_t k = 0; k < target_count; ++k)
+        {
+            if (targets[k] < 0)
+                continue;
+            const texture &t = g.textures[targets[k]];
+            rtvs[k] = t.rtv;
+            if (k == 0)
+            {
+                w = t.width;
+                h = t.height;
+            }
             cmd->barrier(t.res, resource_usage::shader_resource, resource_usage::render_target);
+        }
+
+        // A pass that draws to the back buffer cannot also read it in place.
+        const bool writes_back = targets[0] < 0 || (p.has_target2 && targets[1] < 0);
+        if (writes_back && g_back_readable)
+        {
+            cmd->barrier(g_direct_back, resource_usage::shader_resource, resource_usage::render_target);
+            g_back_readable = false;
         }
 
         std::vector<resource_view> srvs;
         for (size_t i = 0; i < g.textures.size(); ++i)
-            srvs.push_back(int(i) == target ? g.dummy.srv : g.textures[i].srv);
+        {
+            resource_view v = g.textures[i].srv;
+            if (!after && g_direct_back_srv.handle != 0 && g_texdefs[i].back_buffer)
+                v = writes_back ? g.dummy.srv : g_direct_back_srv;
+            if (g_texdefs[i].hud && g_hud_srv.handle != 0)
+                v = g_hud_srv;
+            srvs.push_back(int(i) == targets[0] || int(i) == targets[1] ? g.dummy.srv : v);
+        }
         std::vector<sampler> samplers;
         for (int i = 0; i < 3; ++i)
             samplers.push_back(g.samplers[i]);
 
-        cmd->bind_render_targets_and_depth_stencil(1, &rtv);
+        cmd->bind_render_targets_and_depth_stencil(target_count, rtvs);
         const viewport vp = {0.0f, 0.0f, float(w), float(h), 0.0f, 1.0f};
         cmd->bind_viewports(0, 1, &vp);
         const rect scissor = {0, 0, int32_t(w), int32_t(h)};
@@ -854,14 +1147,321 @@ void run_stage(command_list *cmd, bool after, resource_view back_rtv)
         cmd->push_constants(shader_stage::pixel, g.layout, 2, 0, uint32_t(constants.size()), constants.data());
         cmd->draw(3, 1, 0, 0);
 
-        if (target >= 0)
+        for (uint32_t k = 0; k < target_count; ++k)
         {
-            const texture &t = g.textures[target];
+            if (targets[k] < 0)
+                continue;
+            const texture &t = g.textures[targets[k]];
             cmd->barrier(t.res, resource_usage::render_target, resource_usage::shader_resource);
-            if (t.levels > 1)
+            if (t.levels > 1 && (g_texdefs[targets[k]].mips_if.empty() || setting_on(g_texdefs[targets[k]].mips_if)))
                 cmd->generate_mipmaps(t.srv);
         }
+        mark_time(cmd, ts_of_pass(pi));
     }
+}
+
+// What the panel shows, filled from readbacks a few frames old.
+struct readouts
+{
+    bool stats = false;
+    float peak_nits = 0.0f, avg_nits = 0.0f, bright_nits = 0.0f, exposure_stops = 0.0f;
+    bool gpu = false;
+    float gpu_before_ms = 0.0f, gpu_after_ms = 0.0f;
+    float copy_in_ms = 0.0f, copy_out_ms = 0.0f;
+    std::vector<float> pass_ms;  // one per manifest pass, mips included where a pass has them
+    float cpu_ms = 0.0f, cpu_read_ms = 0.0f, cpu_hist_ms = 0.0f;
+    bool probe = false;
+    float probe_hdr[3] = {}, probe_sdr[3] = {};
+    bool hist = false;
+    float bins[64] = {};
+    uint64_t updated = 0;
+};
+readouts g_read;
+
+// Requests from the panel, which is drawn on the same thread as the stages.
+bool g_want_hist = false;
+bool g_want_probe = false;
+uint32_t g_probe_x = 0, g_probe_y = 0;
+double g_cpu_this_frame = 0.0;
+
+double g_cpu_read_this_frame = 0.0, g_cpu_hist_this_frame = 0.0;
+
+// Adds the time it lives to a running total for this frame. The readout and
+// histogram totals are parts of the whole, which is timed around them.
+struct cpu_timer
+{
+    double &total;
+    LARGE_INTEGER start;
+    explicit cpu_timer(double &t = g_cpu_this_frame) : total(t) { QueryPerformanceCounter(&start); }
+    ~cpu_timer()
+    {
+        LARGE_INTEGER end, freq;
+        QueryPerformanceCounter(&end);
+        QueryPerformanceFrequency(&freq);
+        total += double(end.QuadPart - start.QuadPart) * 1000.0 / double(freq.QuadPart);
+    }
+};
+
+uint32_t slot_of(uint64_t frame) { return uint32_t(frame % kSlots); }
+
+uint32_t before_pass_count()
+{
+    uint32_t n = 0;
+    for (const pass_def &p : g_passes)
+        n += p.after ? 0 : 1;
+    return n;
+}
+uint32_t ts_per_slot() { return 4 + uint32_t(g_passes.size()); }
+uint32_t ts_after_start() { return 2 + before_pass_count(); }
+uint32_t ts_of_pass(size_t pass) { return (g_passes[pass].after ? 4 : 2) + uint32_t(pass); }
+
+void mark_time(command_list *cmd, uint32_t index)
+{
+    monitor &m = g_gpu.mon;
+    if (!m.queries.handle)
+        return;
+    const uint32_t s = slot_of(g_frame_count == 0 ? 0 : g_frame_count - 1);
+    cmd->end_query(m.queries, query_type::timestamp, s * ts_per_slot() + index);
+    (index < ts_after_start() ? m.timed_before[s] : m.timed_after[s]) = true;
+}
+
+float half_to_float(uint16_t h)
+{
+    const uint32_t sign = uint32_t(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0)
+    {
+        if (man == 0)
+            bits = sign;
+        else
+        {
+            int e = -1;
+            uint32_t m2 = man;
+            do { m2 <<= 1; ++e; } while ((m2 & 0x400) == 0);
+            bits = sign | uint32_t(127 - 15 - e) << 23 | (m2 & 0x3FF) << 13;
+        }
+    }
+    else if (exp == 31)
+        bits = sign | 0x7F800000u | man << 13;
+    else
+        bits = sign | (exp + 127 - 15) << 23 | man << 13;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+// First pixel of a mapped readback, as RGB floats.
+void read_pixel(const subresource_data &d, format fmt, uint32_t x, uint32_t y, float out[3])
+{
+    const uint8_t *row = static_cast<const uint8_t *>(d.data) + size_t(y) * d.row_pitch;
+    if (fmt == format::r32g32b32a32_float)
+        memcpy(out, row + size_t(x) * 16, 12);
+    else
+    {
+        const uint16_t *p = reinterpret_cast<const uint16_t *>(row + size_t(x) * 8);
+        for (int i = 0; i < 3; ++i)
+            out[i] = half_to_float(p[i]);
+    }
+}
+
+double setting(const char *name)
+{
+    const uni_def *u = find_uni(name);
+    return u ? u->value : 0.0;
+}
+
+// The shader's GainStops, for the panel. Kept in step with tonemap.hlsl: 203
+// is its PaperWhiteReference and 1.0 its HighlightFreeStops.
+double exposure_stops(double log_peak, double log_avg, double log_bright)
+{
+    (void)log_peak;
+    double exposure = setting("Exposure");
+    if (setting("MatchPaperWhite") != 0.0)
+        exposure += std::log2(203.0 / std::max(setting("GamePaperWhite"), 1.0));
+    const double to_key = std::log2(setting("AutoExposureKey") / std::exp(log_avg));
+    const double auto_ev = to_key * (to_key > 0.0 ? setting("AutoExposureBrighten") : setting("AutoExposureDarken"));
+    const double lead = std::max((log_bright - log_avg) / 0.6931472 - 1.0, 0.0);
+    const double range = setting("AutoExposureRange");
+    return exposure + std::clamp(auto_ev - setting("HighlightAdaptation") * lead, -range, range);
+}
+
+void collect_readouts(device *dev)
+{
+    monitor &m = g_gpu.mon;
+    const uint32_t s = slot_of(g_frame_count);
+    auto smooth = [](float &avg, double &frame) {
+        const float v = float(frame);
+        frame = 0.0;
+        avg = avg == 0.0f ? v : avg + (v - avg) * 0.05f;
+    };
+    smooth(g_read.cpu_ms, g_cpu_this_frame);
+    smooth(g_read.cpu_read_ms, g_cpu_read_this_frame);
+    smooth(g_read.cpu_hist_ms, g_cpu_hist_this_frame);
+    const cpu_timer read_timer(g_cpu_read_this_frame);
+
+    if (m.timed_before[s] && m.frequency != 0)
+    {
+        const uint32_t n = ts_per_slot(), a0 = ts_after_start();
+        std::vector<uint64_t> t(n, 0);
+        const bool before_ok = dev->get_query_heap_results(m.queries, query_type::timestamp, s * n, a0, t.data(), sizeof(uint64_t));
+        const bool after_ok = before_ok && m.timed_after[s] &&
+            dev->get_query_heap_results(m.queries, query_type::timestamp, s * n + a0, n - a0, t.data() + a0, sizeof(uint64_t));
+        if (before_ok)
+        {
+            const float to_ms = 1000.0f / float(m.frequency);
+            auto ms = [&](uint32_t from, uint32_t to) { return t[to] >= t[from] ? float(t[to] - t[from]) * to_ms : -1.0f; };
+            // Each pass is timed from the mark before it: the stage's copy for
+            // its first pass, the previous pass for the rest.
+            std::vector<float> pass(g_passes.size(), 0.0f);
+            uint32_t prev_before = 1, prev_after = a0 + 1, last_before = 1, last_after = a0 + 1;
+            bool sane = true;
+            for (size_t i = 0; i < g_passes.size(); ++i)
+            {
+                const uint32_t idx = ts_of_pass(i);
+                if (g_passes[i].after && !after_ok)
+                    continue;
+                uint32_t &prev = g_passes[i].after ? prev_after : prev_before;
+                pass[i] = ms(prev, idx);
+                sane = sane && pass[i] >= 0.0f && pass[i] < 100.0f;
+                prev = idx;
+                (g_passes[i].after ? last_after : last_before) = idx;
+            }
+            const float copy_in = ms(0, 1), copy_out = after_ok ? ms(a0, a0 + 1) : 0.0f;
+            const float before = ms(0, last_before), after = after_ok ? ms(a0, last_after) : 0.0f;
+            // A pair can straddle a GPU clock change or a reset; skip the absurd ones.
+            if (sane && copy_in >= 0.0f && copy_out >= 0.0f && before >= 0.0f && before < 100.0f && after >= 0.0f && after < 100.0f)
+            {
+                const float k = g_read.gpu ? 0.05f : 1.0f;
+                g_read.gpu_before_ms += (before - g_read.gpu_before_ms) * k;
+                g_read.gpu_after_ms += (after - g_read.gpu_after_ms) * k;
+                g_read.copy_in_ms += (copy_in - g_read.copy_in_ms) * k;
+                g_read.copy_out_ms += (copy_out - g_read.copy_out_ms) * k;
+                g_read.pass_ms.resize(g_passes.size(), 0.0f);
+                for (size_t i = 0; i < pass.size(); ++i)
+                    g_read.pass_ms[i] += (pass[i] - g_read.pass_ms[i]) * k;
+                g_read.gpu = true;
+            }
+        }
+    }
+    m.timed_before[s] = m.timed_after[s] = false;
+
+    const int stats_i = tex_index("TexStats");
+    subresource_data d;
+    if (m.copied[s] && stats_i >= 0 && dev->map_texture_region(m.stats[s], 0, nullptr, map_access::read_only, &d))
+    {
+        float v[3];
+        read_pixel(d, g_gpu.textures[stats_i].fmt, 0, 0, v);
+        dev->unmap_texture_region(m.stats[s], 0);
+        if (std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]))
+        {
+            g_read.peak_nits = std::exp(v[0]);
+            g_read.avg_nits = std::exp(v[1]);
+            g_read.bright_nits = std::exp(v[2]);
+            g_read.exposure_stops = float(exposure_stops(v[0], v[1], v[2]));
+            g_read.stats = true;
+        }
+    }
+    m.copied[s] = false;
+
+    if (m.probed[s] && dev->map_texture_region(m.probe_hdr[s], 0, nullptr, map_access::read_only, &d))
+    {
+        read_pixel(d, g_gpu.textures[tex_index("TexHdr")].fmt, 0, 0, g_read.probe_hdr);
+        dev->unmap_texture_region(m.probe_hdr[s], 0);
+        if (dev->map_texture_region(m.probe_sdr[s], 0, nullptr, map_access::read_only, &d))
+        {
+            read_pixel(d, g_gpu.textures[tex_index("TexProxy")].fmt, 0, 0, g_read.probe_sdr);
+            dev->unmap_texture_region(m.probe_sdr[s], 0);
+            g_read.probe = true;
+        }
+    }
+    m.probed[s] = false;
+
+    // The histogram copy is read back once it is a few frames old.
+    if (m.hist_pending && g_frame_count >= m.hist_frame + kSlots &&
+        dev->map_texture_region(m.hist, 0, nullptr, map_access::read_only, &d))
+    {
+        const cpu_timer hist_timer(g_cpu_hist_this_frame);
+        const format fmt = g_gpu.textures[tex_index("TexMeter")].fmt;
+        // The meter keeps luminance over 80 in blue: scRGB units. Every half
+        // float maps to one bin, so the bin comes from a table on its bits
+        // rather than a conversion and a logarithm per pixel.
+        auto bin_of = [](float v) {
+            const float nits = std::max(v * 80.0f, 1e-4f);
+            return uint8_t(std::clamp(int((std::log2(nits) + 4.0f) / 18.0f * 64.0f), 0, 63));
+        };
+        static std::vector<uint8_t> table;
+        if (table.empty())
+        {
+            table.resize(65536);
+            for (uint32_t h = 0; h < 65536; ++h)
+            {
+                const float v = half_to_float(uint16_t(h));
+                table[h] = std::isfinite(v) ? bin_of(v) : 0;
+            }
+        }
+        uint32_t counts[64] = {};
+        for (uint32_t y = 0; y < m.hist_h; ++y)
+        {
+            const uint8_t *row = static_cast<const uint8_t *>(d.data) + size_t(y) * d.row_pitch;
+            for (uint32_t x = 0; x < m.hist_w; ++x)
+            {
+                if (fmt == format::r16g16b16a16_float)
+                {
+                    uint16_t blue;
+                    memcpy(&blue, row + size_t(x) * 8 + 4, 2);
+                    counts[table[blue]]++;
+                }
+                else
+                {
+                    float px[3];
+                    read_pixel(d, fmt, x, y, px);
+                    counts[bin_of(px[2])]++;
+                }
+            }
+        }
+        float bins[64];
+        for (int i = 0; i < 64; ++i)
+            bins[i] = float(counts[i]);
+        dev->unmap_texture_region(m.hist, 0);
+        memcpy(g_read.bins, bins, sizeof(bins));
+        g_read.hist = true;
+        m.hist_pending = false;
+    }
+    g_read.updated = g_frame_count;
+}
+
+void copy_out(command_list *cmd, int tex, uint32_t mip, const subresource_box *box, resource dst)
+{
+    if (tex < 0 || !dst.handle)
+        return;
+    const resource src = g_gpu.textures[tex].res;
+    cmd->barrier(src, resource_usage::shader_resource, resource_usage::copy_source);
+    cmd->copy_texture_region(src, mip, box, dst, 0, nullptr);
+    cmd->barrier(src, resource_usage::copy_source, resource_usage::shader_resource);
+}
+
+void request_readouts(command_list *cmd)
+{
+    monitor &m = g_gpu.mon;
+    const uint32_t s = slot_of(g_frame_count - 1);
+    copy_out(cmd, tex_index("TexStats"), 0, nullptr, m.stats[s]);
+    m.copied[s] = m.stats[s].handle != 0;
+
+    if (g_want_probe && g_probe_x < g_gpu.width && g_probe_y < g_gpu.height)
+    {
+        const subresource_box box = {g_probe_x, g_probe_y, 0, g_probe_x + 1, g_probe_y + 1, 1};
+        copy_out(cmd, tex_index(setting_on("EnableHdrDeband") ? "TexHdr" : "TexSource"), 0, &box, m.probe_hdr[s]);
+        copy_out(cmd, tex_index("TexProxy"), 0, &box, m.probe_sdr[s]);
+        m.probed[s] = m.probe_hdr[s].handle && m.probe_sdr[s].handle;
+    }
+    if (g_want_hist && !m.hist_pending && m.hist.handle && g_frame_count % 8 == 0)
+    {
+        copy_out(cmd, tex_index("TexMeter"), m.hist_mip, nullptr, m.hist);
+        m.hist_frame = g_frame_count;
+        m.hist_pending = true;
+    }
+    g_want_probe = false;
+    g_want_hist = false;
 }
 
 void set_frame_values()
@@ -878,8 +1478,11 @@ void on_finish_effects(effect_runtime *runtime, command_list *cmd, resource_view
 {
     if (!g_converted || g_output_done)
         return;
+    const cpu_timer timer;
     const resource back_buffer = runtime->get_device()->get_resource_from_view(rtv);
+    mark_time(cmd, ts_after_start());
     copy_back_buffer(cmd, back_buffer);
+    mark_time(cmd, ts_after_start() + 1);
     run_stage(cmd, true, rtv);
     g_output_done = true;
     note_route(route::after_effects);
@@ -1012,16 +1615,39 @@ void run_at_present(command_list *cmd, resource back_buffer, bool before, bool a
 
     // A no-op on D3D11. On D3D12 the buffer is still in the present state here.
     cmd->barrier(back_buffer, resource_usage::present, resource_usage::render_target);
+    const cpu_timer timer;
     if (before)
     {
+        collect_readouts(dev);
         set_frame_values();
-        copy_back_buffer(cmd, back_buffer);
+        query_hud(dev);
+        mark_time(cmd, 0);
+        g_direct_back_srv = direct_back_view(dev, back_buffer);
+        if (g_direct_back_srv.handle != 0)
+        {
+            g_direct_back = back_buffer;
+            cmd->barrier(back_buffer, resource_usage::render_target, resource_usage::shader_resource);
+            g_back_readable = true;
+        }
+        else
+        {
+            copy_back_buffer(cmd, back_buffer);
+        }
+        mark_time(cmd, 1);
         run_stage(cmd, false, rtv);
+        if (g_back_readable)
+            cmd->barrier(back_buffer, resource_usage::shader_resource, resource_usage::render_target);
+        g_back_readable = false;
+        g_direct_back = {0};
+        g_direct_back_srv = {0};
+        request_readouts(cmd);
         g_converted = true;
     }
     if (after)
     {
+        mark_time(cmd, ts_after_start());
         copy_back_buffer(cmd, back_buffer);
+        mark_time(cmd, ts_after_start() + 1);
         run_stage(cmd, true, rtv);
         g_output_done = true;
     }
@@ -1073,7 +1699,7 @@ void tonemap_register()
 
 bool tonemap_outputs_srgb()
 {
-    return g_enabled && g_gpu.ready;
+    return g_outputs_srgb;
 }
 
 // Objects made through a ReShade that has been unloaded cannot be released
@@ -1084,6 +1710,14 @@ void tonemap_forget()
     for (pass_def &p : g_passes)
         p.pipe = {0};
     g_gpu = gpu_state();
+    // HUD Mask goes with the ReShade that loaded it, so its export is looked
+    // up again rather than called through a pointer into an unloaded module.
+    g_hud_fn = nullptr;
+    g_hud_next_lookup = 0;
+    g_hud_kind = -1;
+    g_hud_logged = 0;
+    g_hud_srv = {0};
+    publish_output();
 }
 
 // ReShade's undo icon (Fork Awesome U+F0E2), from the font its overlay already loads.
@@ -1134,14 +1768,15 @@ static bool draw_setting(uni_def &u)
     else if (u.type == "int")
     {
         int i = int(u.value);
-        if (ImGui::SliderInt("##v", &i, int(u.lo), int(u.hi)))
+        const std::string fmt = u.unit.empty() ? "%d" : "%d " + u.unit;
+        if (ImGui::SliderInt("##v", &i, int(u.lo), int(u.hi), fmt.c_str()))
             u.value = i;
         edited = ImGui::IsItemDeactivatedAfterEdit();
     }
     else
     {
-        char fmt[16];
-        snprintf(fmt, sizeof(fmt), "%%.%df", decimals(u.step));
+        char fmt[48];
+        snprintf(fmt, sizeof(fmt), "%%.%df%s%s", decimals(u.step), u.unit.empty() ? "" : " ", u.unit.c_str());
         float f = float(u.value);
         if (ImGui::SliderFloat("##v", &f, u.lo, u.hi, fmt))
             u.value = f;
@@ -1217,42 +1852,422 @@ static bool draw_preset()
     return edited;
 }
 
+// The tone curve as the panel draws it, kept in step with tonemap.hlsl: BT.2390
+// on gray, without the shadow controls, which act around the scene average.
+namespace curve
+{
+double pq_encode(double nits)
+{
+    const double y = std::pow(std::max(nits, 0.0) / 10000.0, 0.1593017578125);
+    return std::pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
+}
+
+double pq_decode(double e)
+{
+    const double p = std::pow(std::max(e, 0.0), 1.0 / 78.84375);
+    return 10000.0 * std::pow(std::max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125);
+}
+
+double knee(double target)
+{
+    const double c = setting("HighlightCompression");
+    return std::max((1.0 + c) * target - c, 0.0);
+}
+
+double bt2390(double nits, double src_peak, double dst_peak)
+{
+    const double src_e = pq_encode(src_peak);
+    double e = std::min(pq_encode(nits) / src_e, 1.0);
+    const double target = pq_encode(dst_peak) / src_e;
+    const double ks = knee(target);
+    if (e > ks)
+    {
+        const double t = (e - ks) / (1.0 - ks), t2 = t * t, t3 = t2 * t;
+        e = (2 * t3 - 3 * t2 + 1) * ks + (t3 - 2 * t2 + t) * (1 - ks) + (-2 * t3 + 3 * t2) * target;
+    }
+    return pq_decode(e * src_e);
+}
+
+double srgb(double v)
+{
+    v = std::clamp(v, 0.0, 1.0);
+    return v <= 0.0031308 ? v * 12.92 : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
+}
+}  // namespace curve
+
+static const char *format_name(format f)
+{
+    switch (f)
+    {
+    case format::r16g16b16a16_float: return "RGBA16F";
+    case format::r10g10b10a2_unorm: return "RGB10A2";
+    case format::r8g8b8a8_unorm: return "RGBA8";
+    case format::b8g8r8a8_unorm: return "BGRA8";
+    default: return "other";
+    }
+}
+
+static const char *dxgi_color_space_name(int cs)
+{
+    switch (cs)
+    {
+    case -1: return "not set by the game";
+    case 0: return "sRGB (G22 P709)";
+    case 1: return "scRGB (G10 P709)";
+    case 12: return "HDR10 (G2084 P2020)";
+    default: return "other";
+    }
+}
+
+// Always visible: what the game sends and what it costs.
+static void draw_status()
+{
+    if (g_gpu.failed)
+    {
+        ImGui::TextDisabled("Tone mapping could not be set up for this swap chain; see ReShade.log.");
+        return;
+    }
+    if (g_color_space == 0)
+    {
+        ImGui::TextDisabled("The game is not in HDR, so there is nothing to tone map.");
+        return;
+    }
+    if (!g_enabled)
+    {
+        ImGui::TextDisabled("Tone mapping is off.");
+        return;
+    }
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%s %ux%u", g_color_space == 2 ? "scRGB" : "HDR10", g_gpu.width, g_gpu.height);
+    if (g_read.stats)
+        n += snprintf(line + n, sizeof(line) - n, "   peak %.0f nits   average %.1f nits   exposure %+.2f stops",
+                      g_read.peak_nits, g_read.avg_nits, g_read.exposure_stops);
+    else
+        n += snprintf(line + n, sizeof(line) - n, "   measuring...");
+    ImGui::TextUnformatted(line);
+    if (g_read.gpu)
+        snprintf(line, sizeof(line), "Cost per frame: GPU %.2f ms   CPU %.2f ms", g_read.gpu_before_ms + g_read.gpu_after_ms, g_read.cpu_ms);
+    else
+        snprintf(line, sizeof(line), "Cost per frame: CPU %.2f ms   GPU timing not available", g_read.cpu_ms);
+    ImGui::TextUnformatted(line);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("What HDR Bridge adds to each frame, averaged.\n"
+                          "GPU, from timestamps: tone map stage %.2f ms, output stage %.2f ms.\n"
+                          "CPU: %.2f ms in all, of which reading back the panel's numbers %.2f ms,\n"
+                          "and building the histogram %.2f ms, only while the histogram is shown.",
+                          g_read.gpu_before_ms, g_read.gpu_after_ms, g_read.cpu_ms, g_read.cpu_read_ms, g_read.cpu_hist_ms);
+}
+
+// The scene histogram in nits, log scale, with the tone curve over it.
+static void draw_histogram()
+{
+    g_want_hist = true;
+    const ImVec2 size(ImGui::GetContentRegionAvail().x, 150.0f);
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##hist", size);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + size.x, p0.y + size.y);
+    dl->AddRectFilled(p0, p1, IM_COL32(20, 22, 28, 255));
+
+    // x: log2 nits from 1/16 to 16384.
+    auto x_of = [&](double nits) { return float(p0.x + (std::log2(std::max(nits, 1e-4)) + 4.0) / 18.0 * size.x); };
+    for (double n : {0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0})
+    {
+        const float x = x_of(n);
+        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(60, 64, 72, 255));
+        char t[16];
+        snprintf(t, sizeof(t), n < 1.0 ? "%.1f" : "%.0f", n);
+        dl->AddText(ImVec2(x + 2, p1.y - 14), IM_COL32(140, 144, 150, 255), t);
+    }
+    if (g_read.hist)
+    {
+        float peak = 1.0f;
+        for (float b : g_read.bins)
+            peak = std::max(peak, b);
+        const float w = size.x / 64.0f;
+        for (int i = 0; i < 64; ++i)
+        {
+            // Square root, so a small population still shows next to a large one.
+            const float h = std::sqrt(g_read.bins[i] / peak) * (size.y - 18.0f);
+            dl->AddRectFilled(ImVec2(p0.x + i * w, p1.y - 16.0f - h), ImVec2(p0.x + (i + 1) * w - 1.0f, p1.y - 16.0f),
+                              IM_COL32(90, 140, 220, 200));
+        }
+    }
+    if (g_read.stats)
+    {
+        // The curve this frame: scene nits to the SDR level it ends up at.
+        const double gain = std::exp2(g_read.exposure_stops);
+        const double white = setting("DisplayWhite");
+        const double peak = std::max(double(g_read.peak_nits) * gain, white);
+        ImVec2 prev;
+        for (int i = 0; i <= 120; ++i)
+        {
+            const double nits = std::exp2(-4.0 + 18.0 * i / 120.0);
+            const double out = curve::srgb(curve::bt2390(nits * gain, peak, white) / white);
+            const ImVec2 pt(x_of(nits), float(p1.y - 16.0f - out * (size.y - 18.0f)));
+            if (i > 0)
+                dl->AddLine(prev, pt, IM_COL32(255, 210, 90, 255), 2.0f);
+            prev = pt;
+        }
+        const double src_e = curve::pq_encode(peak);
+        const double knee_nits = curve::pq_decode(curve::knee(curve::pq_encode(white) / src_e) * src_e) / gain;
+        // Each label on its own row, so two markers close together stay readable.
+        auto marker = [&](double nits, ImU32 col, const char *label, int row) {
+            const float x = x_of(nits);
+            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y - 16.0f), col, 1.5f);
+            dl->AddText(ImVec2(x + 3, p0.y + 2 + row * ImGui::GetTextLineHeight()), col, label);
+        };
+        marker(g_read.avg_nits, IM_COL32(200, 200, 200, 255), "avg", 0);
+        marker(knee_nits, IM_COL32(255, 160, 60, 255), "knee", 1);
+        marker(g_read.peak_nits, IM_COL32(255, 80, 80, 255), "peak", 2);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Scene brightness in nits, before exposure, from a quarter-size copy of the frame.\n"
+                          "Yellow: the SDR level each brightness ends up at. Knee: where the highlight\n"
+                          "roll-off starts. Shadow Contrast and Shadow Lift are not drawn.");
+}
+
+// Reads the pixel under the cursor while the overlay is open.
+static void draw_probe()
+{
+    const ImGuiIO &io = ImGui::GetIO();
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) || io.DisplaySize.x <= 0.0f)
+    {
+        ImGui::TextDisabled("Move the cursor over the game to read a pixel.");
+        return;
+    }
+    g_want_probe = true;
+    g_probe_x = uint32_t(std::clamp(io.MousePos.x / io.DisplaySize.x * float(g_gpu.width), 0.0f, float(g_gpu.width - 1)));
+    g_probe_y = uint32_t(std::clamp(io.MousePos.y / io.DisplaySize.y * float(g_gpu.height), 0.0f, float(g_gpu.height - 1)));
+    if (!g_read.probe)
+        return;
+    const float *h = g_read.probe_hdr, *o = g_read.probe_sdr;
+    const float y = (0.2126f * h[0] + 0.7152f * h[1] + 0.0722f * h[2]) * 80.0f;
+    ImGui::BeginTooltip();
+    ImGui::Text("Pixel %u, %u", g_probe_x, g_probe_y);
+    ImGui::Text("HDR    R %.1f   G %.1f   B %.1f nits", h[0] * 80.0f, h[1] * 80.0f, h[2] * 80.0f);
+    ImGui::Text("       luminance %.1f nits%s", y, std::min(std::min(h[0], h[1]), h[2]) < 0.0f ? ", outside BT.709" : "");
+    ImGui::Text("SDR    %d  %d  %d  (before effects)", int(o[0] * 255.0f + 0.5f), int(o[1] * 255.0f + 0.5f), int(o[2] * 255.0f + 0.5f));
+    ImGui::EndTooltip();
+}
+
+// A legend for the false color view, in the shader's bands.
+static void draw_false_color_legend()
+{
+    struct band { const char *label; float r, g, b; };
+    static const band bands[] = {
+        {"< 0.1", 0.10f, 0.02f, 0.20f}, {"0.1-1", 0.10f, 0.15f, 0.65f}, {"1-10", 0.00f, 0.50f, 0.85f},
+        {"10-50", 0.10f, 0.70f, 0.30f}, {"50-100", 0.60f, 0.80f, 0.20f}, {"100-250", 0.95f, 0.90f, 0.30f},
+        {"250-500", 1.00f, 0.60f, 0.10f}, {"500-1000", 1.00f, 0.25f, 0.10f}, {"1000-4000", 0.90f, 0.00f, 0.35f},
+        {"4000+", 1.00f, 1.00f, 1.00f}};
+    ImGui::TextDisabled("nits:");
+    for (const band &b : bands)
+    {
+        ImGui::SameLine();
+        ImGui::ColorButton(b.label, ImVec4(b.r, b.g, b.b, 1.0f), ImGuiColorEditFlags_NoTooltip, ImVec2(12, 12));
+        ImGui::SameLine(0.0f, 3.0f);
+        ImGui::TextUnformatted(b.label);
+    }
+}
+
+// The compare line, dragged on screen while the overlay is open.
+static bool draw_compare_line()
+{
+    uni_def *on = find_uni("EnableCompare"), *split = find_uni("CompareSplit");
+    if (on == nullptr || split == nullptr || on->value == 0.0)
+        return false;
+    const ImGuiIO &io = ImGui::GetIO();
+    const float x = float(split->value) * io.DisplaySize.x;
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    const float mid = io.DisplaySize.y * 0.5f;
+    // A handle with two arrows, placed from the line itself rather than from a
+    // glyph's metrics, so it is centered in any font.
+    const ImU32 arrow = IM_COL32(30, 30, 30, 255);
+    dl->AddRectFilled(ImVec2(x - 8, mid - 22), ImVec2(x + 8, mid + 22), IM_COL32(255, 255, 255, 220), 4.0f);
+    dl->AddTriangleFilled(ImVec2(x - 2, mid - 5), ImVec2(x - 2, mid + 5), ImVec2(x - 6, mid), arrow);
+    dl->AddTriangleFilled(ImVec2(x + 2, mid - 5), ImVec2(x + 6, mid), ImVec2(x + 2, mid + 5), arrow);
+    dl->AddText(ImVec2(x - 120, 12), IM_COL32(255, 255, 255, 230), "tone mapped");
+    dl->AddText(ImVec2(x + 12, 12), IM_COL32(255, 255, 255, 230), "without");
+
+    static bool dragging = false;
+    const bool near_line = std::abs(io.MousePos.x - x) < 10.0f && !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow);
+    if (near_line || dragging)
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    if (near_line && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        dragging = true;
+    if (!dragging)
+        return false;
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+    {
+        split->value = std::clamp(double(io.MousePos.x / std::max(io.DisplaySize.x, 1.0f)), 0.0, 1.0);
+        return false;
+    }
+    dragging = false;
+    return true;  // released: save
+}
+
+// Each pass's share of the GPU time, so an optimization can aim at the biggest.
+static void draw_pass_timing()
+{
+    if (!g_read.gpu || g_read.pass_ms.size() != g_passes.size())
+    {
+        ImGui::TextDisabled("Waiting for GPU timestamps.");
+        return;
+    }
+    const float total = std::max(g_read.gpu_before_ms + g_read.gpu_after_ms, 1e-4f);
+    auto row = [&](const char *name, float ms) {
+        ImGui::Text("%-16s %6.3f ms  %5.1f%%", name, ms, 100.0f * ms / total);
+        ImGui::SameLine(330.0f);
+        const float w = 200.0f * ms / total;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + 3), ImVec2(p.x + w, p.y + ImGui::GetTextLineHeight() - 1),
+                                                  IM_COL32(90, 140, 220, 220));
+        ImGui::NewLine();
+    };
+    ImGui::TextDisabled("Tone map stage, before the effects");
+    row(g_gpu.back_srvs.empty() || g_gpu.back_srvs.begin()->second.handle == 0 ? "Copy frame in" : "Read frame in", g_read.copy_in_ms);
+    for (size_t i = 0; i < g_passes.size(); ++i)
+        if (!g_passes[i].after)
+            row(g_passes[i].name.c_str(), g_read.pass_ms[i]);
+    ImGui::TextDisabled("Output stage, after the effects");
+    row("Copy frame in", g_read.copy_out_ms);
+    for (size_t i = 0; i < g_passes.size(); ++i)
+        if (g_passes[i].after)
+            row(g_passes[i].name.c_str(), g_read.pass_ms[i]);
+}
+
+static void draw_developer()
+{
+    if (find_uni("DebugView") != nullptr && setting("DebugView") == 1.0)
+        draw_false_color_legend();
+
+    static bool histogram = true, probe = false, info = false, timing = false;
+    ImGui::Checkbox("Histogram", &histogram);
+    ImGui::SameLine();
+    ImGui::Checkbox("Pixel probe", &probe);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Shows the HDR and SDR values of the pixel under the cursor.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Swap chain and display", &info);
+    ImGui::SameLine();
+    ImGui::Checkbox("GPU time per pass", &timing);
+    if (timing)
+        draw_pass_timing();
+    if (histogram && g_color_space != 0 && g_enabled)
+        draw_histogram();
+    if (probe && g_color_space != 0 && g_enabled)
+        draw_probe();
+    if (info)
+    {
+        const bridge_info b = hdrbridge_info();
+        ImGui::Text("Back buffer: %ux%u %s, ReShade sees color space %d", g_gpu.width, g_gpu.height,
+                    format_name(g_gpu.back_format), g_color_space);
+        ImGui::Text("Game asked for: %s", dxgi_color_space_name(b.game_color_space));
+        if (b.hdr10_label >= 0)
+            ImGui::Text("Windows is told: %s", dxgi_color_space_name(b.hdr10_label));
+        if (b.nvapi_hdr_mode != 0)
+            ImGui::Text("NVAPI HDR mode: %d", b.nvapi_hdr_mode);
+        ImGui::Text("Display reported to the game: %.0f nits peak, %.0f full frame, %.3f black",
+                    b.max_nits, b.max_frame_average, b.min_nits);
+        ImGui::Text("Tone map stage %.2f ms, output stage %.2f ms (GPU), %.2f ms (CPU)",
+                    g_read.gpu_before_ms, g_read.gpu_after_ms, g_read.cpu_ms);
+    }
+}
+
 // The HDR Bridge tab.
 static void draw_window(effect_runtime *)
 {
     bool changed = false;
+    draw_status();
+    ImGui::Separator();
     if (ImGui::Checkbox("Tone map the HDR frame for effects", &g_enabled))
     {
         changed = true;
+        publish_output();
         LOG("switched %s in the HDR Bridge tab", g_enabled ? "on" : "off");
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Turns the game's HDR frame into SDR for ReShade's effects and back again after them.\n"
                           "Saved to hdrbridge.cfg beside the add-on.");
-    if (g_gpu.failed)
-        ImGui::TextDisabled("Tone mapping could not be set up for this swap chain; see ReShade.log.");
-    else if (g_color_space == 0)
-        ImGui::TextDisabled("The game is not in HDR, so there is nothing to tone map.");
 
-    std::string category;
-    bool open = false;
-    for (uni_def &u : g_unis)
+    // Sections in the manifest's order. Within one, basic settings come first
+    // and the ones marked advanced fold away under them.
+    std::vector<std::string> categories;
+    for (const uni_def &u : g_unis)
+        if (u.source.empty() && !u.widget.empty() &&
+            std::find(categories.begin(), categories.end(), u.category) == categories.end())
+            categories.push_back(u.category);
+
+    for (const std::string &category : categories)
     {
-        if (!u.source.empty() || u.widget.empty())
+        const bool tone = category == g_preset_category;
+        if (!ImGui::CollapsingHeader(category.c_str(), tone ? ImGuiTreeNodeFlags_DefaultOpen : 0))
             continue;
-        if (u.category != category)
+        if (tone && !g_presets.empty())
+            changed |= draw_preset();
+        // Protect HUD has nothing to work with until HUD Mask supplies a texture.
+        const bool hud = category == "HUD";
+        if (hud)
+            ImGui::BeginDisabled(g_hud_kind == -1 || g_hud_kind == 2);
+        bool any_advanced = false;
+        std::vector<std::string> groups;
+        for (uni_def &u : g_unis)
         {
-            category = u.category;
-            open = ImGui::CollapsingHeader(category.c_str(), category == "Tone Mapping" ? ImGuiTreeNodeFlags_DefaultOpen : 0);
-            if (open && !g_presets.empty() && category == g_preset_category)
-                changed |= draw_preset();
+            if (!u.source.empty() || u.widget.empty() || u.category != category)
+                continue;
+            if (u.advanced)
+            {
+                any_advanced = true;
+                continue;
+            }
+            if (!u.group.empty())
+            {
+                if (std::find(groups.begin(), groups.end(), u.group) == groups.end())
+                    groups.push_back(u.group);
+                continue;
+            }
+            ImGui::PushID(u.name.c_str());
+            changed |= draw_setting(u);
+            ImGui::PopID();
         }
-        if (!open)
-            continue;
-        ImGui::PushID(u.name.c_str());
-        changed |= draw_setting(u);
-        ImGui::PopID();
+        for (const std::string &group : groups)
+        {
+            if (!ImGui::TreeNode((group + "##" + category).c_str()))
+                continue;
+            for (uni_def &u : g_unis)
+            {
+                if (!u.source.empty() || u.widget.empty() || u.category != category || u.group != group || u.advanced)
+                    continue;
+                ImGui::PushID(u.name.c_str());
+                changed |= draw_setting(u);
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        if (any_advanced && ImGui::TreeNode((std::string("Advanced##") + category).c_str()))
+        {
+            for (uni_def &u : g_unis)
+            {
+                if (!u.source.empty() || u.widget.empty() || u.category != category || !u.advanced)
+                    continue;
+                ImGui::PushID(u.name.c_str());
+                changed |= draw_setting(u);
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+        if (hud)
+        {
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("%s", g_hud_kind == -1 ? "HUD Mask is not installed."
+                                    : g_hud_kind == 1 ? "HUD Mask is supplying the game's HUD texture."
+                                    : g_hud_kind == 2 ? "This game draws its HUD onto the back buffer, which Protect HUD cannot use."
+                                    : "HUD Mask is installed but has no HUD this frame, or is switched off.");
+        }
+        if (category == "Developer")
+            draw_developer();
     }
+    changed |= draw_compare_line();
 
     ImGui::Spacing();
     if (ImGui::Button("Reset all to defaults"))

@@ -10,6 +10,10 @@ TEX TexMeter NORMAL W H R16G16B16A16_FLOAT METER -
 TEX TexTiles NORMAL 16 16 R32G32B32A32_FLOAT 1 -
 TEX TexStats NORMAL 1 1 R32G32B32A32_FLOAT 1 -
 TEX TexStatsLast NORMAL 1 1 R32G32B32A32_FLOAT 1 -
+TEX TexMeterHud NORMAL W H R16G16B16A16_FLOAT METER -
+TEX TexTilesHud NORMAL 32 16 R32G32B32A32_FLOAT 1 -
+# The game's HUD texture from HUD Mask, or a blank stand-in without it.
+TEX TexHud HUD 1 1 R8G8B8A8_UNORM 1 -
 SAMSTATE 0 LINEAR LINEAR LINEAR CLAMP CLAMP
 SAMSTATE 1 POINT POINT POINT WRAP WRAP
 SAMSTATE 2 POINT POINT POINT CLAMP CLAMP
@@ -22,8 +26,13 @@ SAM sTexMeter TexMeter 0
 SAM sTexTiles TexTiles 2
 SAM sTexStats TexStats 2
 SAM sTexStatsLast TexStatsLast 2
+SAM sTexMeterHud TexMeterHud 0
+SAM sTexTilesHud TexTilesHud 2
+SAM sTexHud TexHud 0
 UNI float DisplayWhite - 450.000000 0 1
 UNI float Exposure - 0.600000 1 1
+UNI bool MatchPaperWhite - 0 43 1
+UNI float GamePaperWhite - 203.000000 44 1
 UNI float AutoExposureBrighten - 0.200000 2 1
 UNI float AutoExposureDarken - 0.200000 3 1
 UNI float AutoExposureKey - 8.000000 4 1
@@ -35,6 +44,8 @@ UNI float Saturation - 1.100000 9 1
 UNI float ShadowContrast - 0.000000 10 1
 UNI float ShadowSpan - 5.000000 11 1
 UNI float ShadowLift - 0.000000 12 1
+UNI float HighlightCompression - 0.500000 41 1
+UNI float AutoExposureRange - 3.000000 42 1
 UNI bool EnableHdrDeband - 0 13 1
 UNI float HdrDebandThreshold - 5.000000 14 1
 UNI float HdrDebandRadius - 32.000000 15 1
@@ -59,19 +70,40 @@ UNI int DebandSourceIterations - 1 33 1
 UNI float DebandSourceDetail - 0.850000 34 1
 UNI bool EnableDithering - 1 35 1
 UNI float DitherStrength - 2.000000 36 1
+UNI bool StaticGrain - 0 45 1
+UNI bool ProtectHud - 0 49 1
+UNI float HudBrightness - 0.000000 50 1
 UNI bool DebugMeter - 0 37 1
 UNI bool DebugDeband - 0 38 1
+UNI int DebugView - 0 46 1
+UNI bool EnableCompare - 0 47 1
+UNI float CompareSplit - 0.500000 48 1
+UNI int HudAvailable hudavailable 0 51 1
+UNI int HudActive hudactive 0 52 1
 UNI float FrameTime frametime - 39 1
 UNI int FrameCount framecount - 40 1
+# PASS name, vertex shader, pixel shader, render target and an optional second
+# one, written as SV_Target1. A target of - is the back buffer.
 STAGE before
 PASS Source PostProcessVS PS_Source TexSource
 PASS Deband PostProcessVS PS_Deband TexHdr
 PASS Meter PostProcessVS PS_Meter TexMeter
+PASS MeterHud PostProcessVS PS_MeterHud TexMeter TexMeterHud
 PASS Tiles PostProcessVS PS_Tiles TexTiles
+PASS TilesHud PostProcessVS PS_TilesHud TexTilesHud
 PASS Stats PostProcessVS PS_Stats TexStats
 PASS SaveStats PostProcessVS PS_SaveStats TexStatsLast
-PASS ToneMap PostProcessVS PS_ToneMap TexProxy
-PASS Hand PostProcessVS PS_Hand -
+PASS ToneMap PostProcessVS PS_ToneMap TexProxy -
+
+# Work only the HDR frame debander needs: its pass, and the source's mips.
+SKIPIF Deband EnableHdrDeband
+MIPSIF TexSource EnableHdrDeband
+# Protect HUD meters through its own passes; ! runs a pass only while the
+# setting is off.
+SKIPIF Meter !HudActive
+SKIPIF MeterHud HudActive
+SKIPIF TilesHud HudActive
+MIPSIF TexMeterHud HudActive
 STAGE after
 PASS Output PostProcessVS PS_Output -
 
@@ -117,7 +149,7 @@ UI Saturation slider 0.5 2.0 0.01
 LABEL Saturation Saturation
 CATEGORY Saturation Tone Mapping
 TIP Saturation Color gain after tone mapping. 1.0 keeps the HDR frame's own color; the\ndefault 1.10 matches the extra color a game's SDR grade usually adds.
-UI ShadowContrast slider 0.0 2.5 0.05
+UI ShadowContrast slider 0.0 2.0 0.05
 LABEL ShadowContrast Shadow Contrast
 CATEGORY ShadowContrast Tone Mapping
 TIP ShadowContrast Steepens the tones below the scene's average brightness, the way an\nSDR grade does, for more texture in the shadows. 0 is off.
@@ -164,60 +196,60 @@ CATEGORY ColorDeband Debanding: HDR Frame
 TIP ColorDeband How much harder color is smoothed than brightness. Raise it if skies\nshow colored contours; 1 treats both alike.
 UI EnableDeband check 0 1 0.01
 LABEL EnableDeband Enable
-CATEGORY EnableDeband Debanding: SDR Frame
+CATEGORY EnableDeband Debanding: Output
 TIP EnableDeband Repairs banding in the SDR frame, after the effects. What the effects changed\nand what they left alone are judged separately, below. Off unless you see banding.
 UI DebandMaxCorrection slider 0.5 8.0 0.1
 LABEL DebandMaxCorrection Correction Limit
-CATEGORY DebandMaxCorrection Debanding: SDR Frame
+CATEGORY DebandMaxCorrection Debanding: Output
 TIP DebandMaxCorrection Furthest the debander may move a pixel, in 8-bit steps.
 UI DebandSplit slider 0.25 8.0 0.05
 LABEL DebandSplit Split Point
-CATEGORY DebandSplit Debanding: SDR Frame
-TIP DebandSplit How far the effects must have moved a pixel, in 8-bit steps, before it is\nhanded to the Shader Effect settings instead of the Source Image ones.
+CATEGORY DebandSplit Debanding: Output
+TIP DebandSplit How far the effects must have moved a pixel, in 8-bit steps, for it to count as\nan edited area rather than an untouched one.
 UI DebandTaps combo 0 1 1
 LABEL DebandTaps Samples
-CATEGORY DebandTaps Debanding: SDR Frame
+CATEGORY DebandTaps Debanding: Output
 TIP DebandTaps Samples per pass, spread over a disc.
 ITEMS DebandTaps 8 samples|16 samples|24 samples|32 samples
 UI EnableDebandEffect check 0 1 0.01
 LABEL EnableDebandEffect Enable
-CATEGORY EnableDebandEffect Debanding: Shader Effect
+CATEGORY EnableDebandEffect Debanding: Output
 TIP EnableDebandEffect Deband what the effects changed.
 UI DebandEffectThreshold slider 0.5 8.0 0.1
 LABEL DebandEffectThreshold Threshold
-CATEGORY DebandEffectThreshold Debanding: Shader Effect
+CATEGORY DebandEffectThreshold Debanding: Output
 TIP DebandEffectThreshold How flat an area must be to count as a band, in 8-bit steps.
 UI DebandEffectRadius slider 4.0 64.0 1.0
 LABEL DebandEffectRadius Radius
-CATEGORY DebandEffectRadius Debanding: Shader Effect
+CATEGORY DebandEffectRadius Debanding: Output
 TIP DebandEffectRadius How far the first pass looks for the true value of a flat area, in\npixels at 1080p. Later passes reach further.
 UI DebandEffectIterations slider 1 4 1
 LABEL DebandEffectIterations Passes
-CATEGORY DebandEffectIterations Debanding: Shader Effect
+CATEGORY DebandEffectIterations Debanding: Output
 TIP DebandEffectIterations How many passes, each reaching further and judging more strictly.
 UI DebandEffectDetail slider 0.0 4.0 0.05
 LABEL DebandEffectDetail Detail Guard
-CATEGORY DebandEffectDetail Debanding: Shader Effect
+CATEGORY DebandEffectDetail Debanding: Output
 TIP DebandEffectDetail How much pixel-to-pixel variation marks an area as texture and puts it\nout of reach. 0 disables the guard.
 UI EnableDebandSource check 0 1 0.01
 LABEL EnableDebandSource Enable
-CATEGORY EnableDebandSource Debanding: Source Image
+CATEGORY EnableDebandSource Debanding: Output
 TIP EnableDebandSource Deband the tone mapped frame where the effects left it alone.
 UI DebandSourceThreshold slider 0.5 8.0 0.1
 LABEL DebandSourceThreshold Threshold
-CATEGORY DebandSourceThreshold Debanding: Source Image
+CATEGORY DebandSourceThreshold Debanding: Output
 TIP DebandSourceThreshold How flat an area must be to count as a band, in 8-bit steps.
 UI DebandSourceRadius slider 4.0 64.0 1.0
 LABEL DebandSourceRadius Radius
-CATEGORY DebandSourceRadius Debanding: Source Image
+CATEGORY DebandSourceRadius Debanding: Output
 TIP DebandSourceRadius How far the first pass looks for the true value of a flat area, in\npixels at 1080p. Later passes reach further.
 UI DebandSourceIterations slider 1 4 1
 LABEL DebandSourceIterations Passes
-CATEGORY DebandSourceIterations Debanding: Source Image
+CATEGORY DebandSourceIterations Debanding: Output
 TIP DebandSourceIterations How many passes, each reaching further and judging more strictly.
 UI DebandSourceDetail slider 0.0 4.0 0.05
 LABEL DebandSourceDetail Detail Guard
-CATEGORY DebandSourceDetail Debanding: Source Image
+CATEGORY DebandSourceDetail Debanding: Output
 TIP DebandSourceDetail How much pixel-to-pixel variation marks an area as texture and puts it\nout of reach. 0 disables the guard.
 UI EnableDithering check 0 1 0.01
 LABEL EnableDithering Enable Dithering
@@ -226,15 +258,104 @@ TIP EnableDithering Adds a sub-level noise pattern so gradients survive Windows 
 UI DitherStrength slider 0.0 3.0 0.01
 LABEL DitherStrength Dither Strength
 CATEGORY DitherStrength Output
-TIP DitherStrength Dither amplitude in 8-bit steps. 1.0 is what the maths asks for; toward 3\nit stops hiding steps and starts to show as grain.
+TIP DitherStrength Dither amplitude in 8-bit steps. 1.0 is what the math asks for; toward 3\nit stops hiding steps and starts to show as grain.
+UI ProtectHud check 0 1 0.01
+LABEL ProtectHud Protect HUD
+CATEGORY ProtectHud HUD
+TIP ProtectHud Keeps the game's HUD steady. It is tone mapped at a fixed exposure, set by Exposure\nand HUD Brightness, rather than following the scene, and gets no debanding or dither. It is also\nleft out of the metering, except in full-screen menus. Effects still apply. Needs HUD Mask.
+UI HudBrightness slider -2.0 2.0 0.05
+LABEL HudBrightness HUD Brightness
+CATEGORY HudBrightness HUD
+TIP HudBrightness Brightens or darkens the HUD, in stops, on top of Exposure. The scene is\nnot affected.
 UI DebugMeter check 0 1 0.01
 LABEL DebugMeter Debug Meter
-CATEGORY DebugMeter Output
+CATEGORY DebugMeter Developer
 TIP DebugMeter Bars in the top left corner: scene average and bright level in nits,\nmeasured peak in nits, and exposure gain in stops.
 UI DebugDeband check 0 1 0.01
 LABEL DebugDeband Debug Deband
-CATEGORY DebugDeband Output
-TIP DebugDeband Shows where the SDR frame debanding moved pixels, one grey level per\nhalf an 8-bit step.
+CATEGORY DebugDeband Developer
+TIP DebugDeband Shows where debanding moves pixels over a dimmed picture: magenta for the output\ndebander, even while it is off, so it can be judged first; green for the HDR frame debander.
+
+UI MatchPaperWhite check 0 1 0.01
+LABEL MatchPaperWhite Match Game Paper White
+CATEGORY MatchPaperWhite Tone Mapping
+TIP MatchPaperWhite Compensates Exposure for the Paper White set in the game's own HDR menu, so\nthe picture stays where the defaults put it whatever that setting is.
+UI GamePaperWhite slider 80.0 500.0 1.0
+LABEL GamePaperWhite Game Paper White
+CATEGORY GamePaperWhite Tone Mapping
+TIP GamePaperWhite The Paper White value from the game's HDR settings. Used only with Match\nGame Paper White; 203 nits, the BT.2408 reference, leaves Exposure as it is.
+UI HighlightCompression slider 0.0 1.0 0.01
+LABEL HighlightCompression Highlight Compression
+CATEGORY HighlightCompression Tone Mapping
+TIP HighlightCompression Where the highlight roll-off starts. Lower keeps highlights brighter until they\nreach white, higher starts compressing earlier and keeps more detail in them. 0 clips them.
+UI AutoExposureRange slider 0.5 6.0 0.1
+LABEL AutoExposureRange Auto Exposure Range
+CATEGORY AutoExposureRange Tone Mapping
+TIP AutoExposureRange How far auto exposure and highlight adaptation may move the exposure, either\nway. Widen it for games whose scenes swing between very dark and very bright.
+UI StaticGrain check 0 1 0.01
+LABEL StaticGrain Static Grain
+CATEGORY StaticGrain Output
+TIP StaticGrain Keeps the dither pattern still instead of changing it every frame. For anyone\nwho sees the moving pattern shimmer; a still pattern hides banding slightly less well.
+UI DebugView combo 0 1 1
+LABEL DebugView Debug View
+CATEGORY DebugView Developer
+TIP DebugView Replaces the picture with a diagnostic view.
+ITEMS DebugView Off|False color by nits|SDR clipping|Out of gamut|Invalid pixels|Without tone mapping|HUD coverage
+UI EnableCompare check 0 1 0.01
+LABEL EnableCompare Compare
+CATEGORY EnableCompare Developer
+TIP EnableCompare Splits the screen: tone mapped on the left, and on the right the HDR frame clipped\nat SDR white, as Windows shows a float frame without tone mapping. Drag the line with the overlay open.
+UI CompareSplit slider 0.0 1.0 0.01
+LABEL CompareSplit Compare Split
+CATEGORY CompareSplit Developer
+TIP CompareSplit Where the compare line sits, from the left edge to the right.
+
+# Settings drawn under Advanced in their section, settings no preset sets,
+# groups folded inside a section, and the unit a slider shows after its value.
+ADVANCED AutoExposureBrighten
+ADVANCED AutoExposureDarken
+ADVANCED AutoExposureKey
+ADVANCED HighlightAdaptation
+ADVANCED AdaptBrighter
+ADVANCED AdaptDarker
+ADVANCED ShadowContrast
+ADVANCED ShadowSpan
+ADVANCED ShadowLift
+ADVANCED HighlightCompression
+ADVANCED AutoExposureRange
+NOPRESET MatchPaperWhite
+GROUP EnableDebandEffect Edited Areas
+GROUP DebandEffectThreshold Edited Areas
+GROUP DebandEffectRadius Edited Areas
+GROUP DebandEffectIterations Edited Areas
+GROUP DebandEffectDetail Edited Areas
+GROUP EnableDebandSource Untouched Areas
+GROUP DebandSourceThreshold Untouched Areas
+GROUP DebandSourceRadius Untouched Areas
+GROUP DebandSourceIterations Untouched Areas
+GROUP DebandSourceDetail Untouched Areas
+NOPRESET GamePaperWhite
+NOPRESET ProtectHud
+NOPRESET HudBrightness
+UNIT DisplayWhite nits
+UNIT Exposure stops
+UNIT GamePaperWhite nits
+UNIT HudBrightness stops
+UNIT AutoExposureKey nits
+UNIT AdaptBrighter s
+UNIT AdaptDarker s
+UNIT ShadowSpan stops
+UNIT AutoExposureRange stops
+UNIT HdrDebandThreshold steps
+UNIT HdrDebandRadius px
+UNIT HdrDebandCorrection steps
+UNIT DebandMaxCorrection steps
+UNIT DebandSplit steps
+UNIT DebandEffectThreshold steps
+UNIT DebandEffectRadius px
+UNIT DebandSourceThreshold steps
+UNIT DebandSourceRadius px
+UNIT DitherStrength steps
 
 # Presets for the Tone Mapping settings. The first is the defaults above; the
 # others list only what they change. Names are single words.

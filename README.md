@@ -32,7 +32,7 @@ does accept HDR, use the game's HDR normally.
 - Labels the swap chain so Windows shows it correctly. A float swap chain in
   NVAPI HDR mode is declared scRGB, which is what the driver would have done;
   without it Windows shows the linear values two stops dark. An HDR10 swap
-  chain is labelled sRGB while the tone mapping runs, since the frame is sRGB
+  chain is labeled sRGB while the tone mapping runs, since the frame is sRGB
   by the time it is shown, and the game and ReShade still see the PQ color
   space the game asked for. With the tone mapping off it keeps its PQ label
   and Windows converts it for the SDR display.
@@ -85,10 +85,12 @@ frame on an SDR signal, and it is expected.
 
 ## Tone mapping
 
-The tone mapping has its own HDR Bridge tab in ReShade's overlay: exposure and
-how it adapts, highlights, shadows and color, then debanding and dither.
-Hover a setting for what it does. A reset button appears beside any setting
-that has moved.
+The tone mapping has its own HDR Bridge tab in ReShade's overlay. At the top
+it shows what the game is sending and what HDR Bridge costs: the HDR mode, the
+measured peak and average in nits, the exposure in stops, and the GPU and CPU
+time it adds to each frame. Below that, the settings most people need come
+first, and the rest fold away under Advanced. Hover a setting for what
+it does. A reset button appears beside any setting that has moved.
 
 ![The HDR Bridge tab in the ReShade overlay, on the Vivid preset](screenshots/tone-mapping.png)
 
@@ -121,11 +123,45 @@ rings, where Standard compresses them away with the rest of the highlight. A
 clean frame has none, but some upscaler models hand over a stepped one. If a
 sun or a lamp grows rings, try another upscaler model or use Standard.
 
+Match Game Paper White takes the Paper White value from the game's own HDR
+menu and compensates Exposure for it, so the picture stays put whatever that
+menu says. Highlight Compression, under Advanced, moves where the roll-off
+starts: lower keeps highlights bright until they reach white, higher keeps
+more detail in them. Auto Exposure Range sets how far exposure may adapt
+either way.
+
 Debanding is off by default, since it costs some faint texture and a clean
 frame does not need it. Turn it on for a game whose skies or glows arrive
-banded.
+banded. The dither that hides the 8-bit steps changes every frame; Static
+Grain holds it still for anyone who sees it shimmer.
 
 ![The HDR frame debanding and output settings](screenshots/debanding.png)
+
+### Protect HUD
+
+With [HUD Mask](https://github.com/danyalziakhan/hudmask) installed, Protect HUD
+keeps the game's HUD steady. With Protect HUD off, the HUD rides the scene's
+exposure: in Odyssey, a fight in a ship full of black smoke brightens the
+exposure and the HUD with it. With it on, the HUD is tone mapped like
+everything else but at a fixed exposure, set by Exposure, Match Game Paper
+White and HUD Brightness, so auto exposure and highlight adaptation never reach
+it. The highlight roll-off still follows the scene's peak, which only touches
+the brightest parts of the HUD. It also skips the debanding and the dither,
+blended by its own alpha so translucent panels keep their share of the scene
+behind them. ReShade effects still apply to it; one that should leave the HUD
+alone can read HUD Mask's texture itself, as PHDRPlus does. Games that draw
+full-screen menus as HUD, Odyssey among them, get those menus at the same fixed
+exposure.
+
+The HUD is also left out of the metering, so bright text does not set the peak
+and a dark panel does not lift the exposure. A full-screen menu leaves nothing
+else to meter, so as the visible part of the screen falls from 40% to 15% the
+metering hands back to the whole frame and the exposure keeps following it.
+
+The toggle is grayed out without HUD Mask, and in games where HUD Mask finds the
+HUD on the back buffer rather than in a texture of its own: there the mask is
+only built after the frame has already been tone mapped. The line under it says
+which applies. Debug View has a HUD coverage view for checking the mask.
 
 Changes apply at once and are saved to `hdrbridge.cfg` next to the add-on, one
 file per game. It is plain text, `Name=value` per line with `#` for comments.
@@ -142,6 +178,27 @@ Exposure=0.4
 
 `Enabled=0` switches the tone mapping off and leaves the frame as the game
 drew it, for an effect chain that does its own.
+
+## For developers
+
+The Developer section of the tab is for anyone working on HDR, a mod or an
+effect:
+
+- Debug views, in place of the picture: false color by scene brightness in
+  nits, with a legend; pixels clipped to SDR white or crushed to black;
+  colors outside BT.709; NaN pixels the game sent; and the frame
+  without tone mapping.
+- Compare splits the screen, tone mapped on the left and on the right the HDR
+  frame clipped at SDR white, which is what Windows shows of a float frame
+  without tone mapping. Drag the line with the overlay open.
+- A histogram of the scene in nits, on a log scale, with the tone curve drawn
+  over it and markers for the scene average, the start of the highlight
+  roll-off and the measured peak.
+- A pixel probe that reads the HDR value in nits and the tone mapped SDR value
+  of the pixel under the cursor.
+- The swap chain's format, the color space the game asked for and what
+  Windows is told, the display luminance reported to the game, and the GPU
+  time of each stage.
 
 The shader is `shaders\tonemap.hlsl`, laid out by `shaders\tonemap.manifest`,
 and both are built into the add-on. The same files run in
@@ -169,7 +226,7 @@ fullscreen. Everything else is read once at startup. All keys are optional, in
 | `MinLuminance` | 0.005 | Black level nits reported to the game |
 | `MaxFrameAverageLuminance` | 4000 | Full frame nits reported to the game |
 | `BorderlessFullscreen` | 1 | Run a game that asks for exclusive fullscreen in a borderless window covering the monitor |
-| `CaptureKey` | 120 (F9) | Virtual key code that saves a frame |
+| `CaptureKey` | 145 (Scroll Lock) | Virtual key code that saves a frame |
 | `OutputPath` | `HDRBridge Captures` next to the game | Where captures go |
 | `HideNVAPIFromGame` | 0 | Diagnostic: deny NVAPI to the game's own code, so it takes the path it uses on AMD and Intel. Needs `SpoofNVAPI` |
 | `TraceGameCalls` | 0 | Diagnostic: log the registry reads, device enumeration and NVAPI driver settings reads the game's own code makes |

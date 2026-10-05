@@ -44,9 +44,24 @@ def main():
     (a.out / "effect.hlsl").write_text("\n".join(defines) + "\n" + hlsl, encoding="utf-8")
 
     back = "R16G16B16A16_FLOAT" if a.color_space == 2 else "R10G10B10A2_UNORM"
+    lines = (HERE / "tonemap.manifest").read_text(encoding="utf-8").splitlines()
+
+    # Uniforms the add-on fills in itself stay at zero under fxshot, so a pass
+    # skipped on one of them is dropped here, as the add-on would drop it.
+    # Settings are set by the run, so their skip rules are left to it.
+    sourced = {l.split()[2] for l in lines if l.startswith("UNI ") and l.split()[3] != "-"}
+    dropped = set()
+    for l in lines:
+        if l.startswith("SKIPIF "):
+            _, name, setting = l.split()
+            if setting.lstrip("!") in sourced and not setting.startswith("!"):
+                dropped.add(name)
+
     stage, out = None, []
-    for line in (HERE / "tonemap.manifest").read_text(encoding="utf-8").splitlines():
+    for line in lines:
         if not line or line.startswith("#"):
+            continue
+        if line.startswith("PASS ") and line.split()[1] in dropped:
             continue
         if line.startswith("STAGE "):
             stage = line.split()[1]

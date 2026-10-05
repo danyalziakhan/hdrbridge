@@ -59,7 +59,8 @@ static std::atomic<bool> g_borderless{true};
 static float g_max_nits     = 4000.0f;
 static float g_min_nits     = 0.005f;
 static float g_max_fall     = 4000.0f;
-static std::atomic<int> g_capture_key{VK_F9};
+// Scroll Lock rather than a function key: F9 is quick load in a lot of games.
+static std::atomic<int> g_capture_key{VK_SCROLL};
 
 static std::filesystem::path g_output_dir;
 
@@ -352,7 +353,7 @@ static thread_local bool t_own_call = false;
 // ordinary sRGB by the time it is shown, and a PQ label would make DWM convert
 // it a second time. So the game is told PQ was accepted, ReShade's own record
 // stays PQ so the tone mapping decodes the frame on that basis, and the swap
-// chain is really labelled sRGB. With the tone mapping off, or not set up yet,
+// chain is really labeled sRGB. With the tone mapping off, or not set up yet,
 // the swap chain keeps PQ and DWM converts the HDR10 frame itself.
 static DXGI_COLOR_SPACE_TYPE real_label(DXGI_COLOR_SPACE_TYPE cs)
 {
@@ -370,7 +371,7 @@ static HRESULT STDMETHODCALLTYPE hook_SetColorSpace1(IDXGISwapChain3 *self, DXGI
     HRESULT hr = real_SetColorSpace1(self, real_cs);
     g_hdr10_label = static_cast<int>(real_cs);
     LOG("IDXGISwapChain3::SetColorSpace1(%d)%s: real result 0x%08X", static_cast<int>(cs),
-        real_cs != cs ? ", labelled sRGB for Windows" : "", static_cast<unsigned>(hr));
+        real_cs != cs ? ", labeled sRGB for Windows" : "", static_cast<unsigned>(hr));
     if (FAILED(hr) && g_spoof_dxgi)
         hr = S_OK;
     return hr;
@@ -1075,7 +1076,7 @@ static void declare_scrgb(swapchain *sc)
 }
 
 // The tone mapping can be switched in the overlay, and it only starts once
-// ReShade has a runtime, both well after the game labelled its swap chain. So
+// ReShade has a runtime, both well after the game labeled its swap chain. So
 // an HDR10 swap chain's real label is checked every frame and moved to match.
 static void follow_tone_mapping(swapchain *sc)
 {
@@ -1094,22 +1095,48 @@ static void follow_tone_mapping(swapchain *sc)
     t_own_call = false;
     sc3->Release();
     g_hdr10_label = static_cast<int>(want);
-    LOG("labelled the HDR10 swap chain %s for Windows, result 0x%08X",
-        want == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 ? "sRGB, as the tone mapping is on" : "PQ, as the tone mapping is off",
-        static_cast<unsigned>(hr));
+    const bool srgb = want == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    LOG("HDR10 swap chain labeled %s for Windows, since the tone mapping is %s, result 0x%08X",
+        srgb ? "sRGB" : "PQ", srgb ? "on" : "off", static_cast<unsigned>(hr));
 }
 
 // Settings panel, under this add-on in ReShade's Add-ons tab. Changes are
 // written back to ReShade.ini at once.
 
-static std::atomic<bool> g_capture_was_down{false};
 static bool g_listening = false;
-static bool g_held_at_listen[256] = {};
+static int g_listen_frame = 0;               // ImGui frame listening was last drawn on
+static std::atomic<bool> g_capture_pending{false};
+static bool g_skip_capture = false;          // the press that set the key is not a capture
+
+// ReShade's own hotkeys, which cannot double as the capture key.
+static bool is_reshade_hotkey(int vk)
+{
+    for (const char *name : {"KeyOverlay", "KeyEffects", "KeyScreenshot", "KeyReload", "KeyNextPreset", "KeyPreviousPreset"})
+    {
+        // Stored as "keycode,ctrl,shift,alt"; the key code comes first.
+        char text[64] = {};
+        size_t size = sizeof(text);
+        if (reshade::get_config_value(nullptr, "INPUT", name, text, &size) && atoi(text) == vk)
+            return true;
+    }
+    return false;
+}
 
 static std::string key_name(int vk)
 {
     if (vk >= VK_F1 && vk <= VK_F24)
         return "F" + std::to_string(vk - VK_F1 + 1);
+    // Keys without a plain scan code, which GetKeyNameText cannot name.
+    switch (vk)
+    {
+    case VK_PAUSE:    return "Pause";
+    case VK_CANCEL:   return "Break";
+    case VK_SNAPSHOT: return "Print Screen";
+    case VK_SCROLL:   return "Scroll Lock";
+    case VK_LWIN:     return "Left Windows";
+    case VK_RWIN:     return "Right Windows";
+    case VK_APPS:     return "Menu";
+    }
     UINT scan = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
     switch (vk)
     {
@@ -1126,40 +1153,41 @@ static std::string key_name(int vk)
     return code;
 }
 
-static void draw_settings(effect_runtime *)
+static void draw_settings(effect_runtime *runtime)
 {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Capture key");
     ImGui::SameLine();
     const std::string label = (g_listening ? std::string("Press a key, Esc to cancel") : key_name(g_capture_key)) + "###capture_key";
+    const int frame = ImGui::GetFrameCount();
+    // Closed or collapsed mid-listen: drop it rather than wait unseen.
+    if (g_listening && frame != g_listen_frame + 1)
+        g_listening = false;
+    bool started = false;
     if (ImGui::Button(label.c_str(), ImVec2(220.0f, 0.0f)) && !g_listening)
-    {
-        // Keys already held when listening starts do not count, or the click
-        // that opened it could be taken for the answer.
-        for (int vk = 0; vk < 256; ++vk)
-            g_held_at_listen[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        g_listening = true;
-    }
+        g_listening = started = true;
+    g_listen_frame = frame;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Saves the game's frame before any effect runs, as a float image.");
 
-    if (g_listening)
+    // Asked of ReShade rather than of Windows: while the overlay is open ReShade
+    // blocks input from the game by hooking GetAsyncKeyState, and every key
+    // then reads as up. Only a key pressed this frame counts, and not on the
+    // frame listening starts, so the Space or Enter that pressed the button is
+    // not taken for the answer. Mouse buttons sit below 0x08 and are skipped.
+    if (g_listening && !started && runtime != nullptr)
     {
         for (int vk = 0x08; vk < 256; ++vk)
         {
-            const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-            if (!down)
-            {
-                g_held_at_listen[vk] = false;
-                continue;
-            }
             // Generic modifier codes duplicate their left and right forms.
-            if (g_held_at_listen[vk] || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU)
+            if (!runtime->is_key_pressed(vk) || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU)
+                continue;
+            if (vk != VK_ESCAPE && is_reshade_hotkey(vk))
                 continue;
             if (vk != VK_ESCAPE)
             {
                 g_capture_key = vk;
-                g_capture_was_down = true; // no capture from the key press that set it
+                g_skip_capture = true;
                 reshade::set_config_value(nullptr, "HDRBRIDGE", "CaptureKey", vk);
                 LOG("capture key set to %s (0x%02X)", key_name(vk).c_str(), vk);
             }
@@ -1188,10 +1216,21 @@ static void on_present(command_queue *queue, swapchain *sc, const rect *, const 
     declare_scrgb(sc);
     follow_tone_mapping(sc);
 
-    const bool down = (GetAsyncKeyState(g_capture_key) & 0x8000) != 0;
-    if (down && !g_capture_was_down && !g_listening)
+    // Seen at the end of the previous frame, taken here before any effect runs.
+    if (g_capture_pending.exchange(false))
         capture(queue, sc);
-    g_capture_was_down = down;
+}
+
+// The capture key is read through ReShade, the same input the binding uses, so
+// it works with the overlay open and only while the game has focus.
+static void on_reshade_present(effect_runtime *runtime)
+{
+    if (g_listening || !runtime->is_key_pressed(g_capture_key))
+        return;
+    if (g_skip_capture)
+        g_skip_capture = false;
+    else
+        g_capture_pending = true;
 }
 
 static DWORD WINAPI init_thread(LPVOID)
@@ -1218,6 +1257,7 @@ static bool register_with_reshade()
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
     reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
     reshade::register_event<reshade::addon_event::present>(on_present);
+    reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
     tonemap_register();
     reshade::register_overlay(nullptr, draw_settings);
     return true;
@@ -1280,6 +1320,21 @@ static void watch_reshade_reloads()
         reg(0, on_dll_notification, nullptr, &cookie);
 }
 
+bridge_info hdrbridge_info()
+{
+    bridge_info i;
+    i.game_color_space = g_game_color_space;
+    i.hdr10_label = g_hdr10_label;
+    i.nvapi_hdr_mode = g_nv_hdr_mode;
+    i.max_nits = g_max_nits;
+    i.min_nits = g_min_nits;
+    i.max_frame_average = g_max_fall;
+    return i;
+}
+
+// False when ReShade declined the add-on at load, and then nothing is set up.
+static bool g_active = false;
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     switch (reason)
@@ -1287,7 +1342,19 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     case DLL_PROCESS_ATTACH:
         g_module = module;
         if (!register_with_reshade())
-            return FALSE;
+        {
+            // A ReShade that declined it, which is how an add-on switched off
+            // in the Add-ons tab arrives: stay loaded and do nothing, since
+            // failing DllMain makes ReShade log a load error. With no ReShade
+            // at all, fail, so a ReShade loaded later can run this
+            // DllMain again.
+            if (GetProcAddress(reshade::internal::get_reshade_module_handle(), "ReShadeLogMessage") == nullptr)
+                return FALSE;
+            reshade::log::message(reshade::log::level::info,
+                "HDR Bridge is disabled in ReShade's Add-ons tab, or this ReShade cannot load it; it does nothing this session.");
+            break;
+        }
+        g_active = true;
         tonemap_init(module);
         MH_Initialize();
         watch_reshade_reloads();
@@ -1298,6 +1365,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             CloseHandle(t);
         break;
     case DLL_PROCESS_DETACH:
+        if (!g_active)
+            break;
         if (g_reshade_alive)
             reshade::unregister_addon(module);
         MH_Uninitialize();
