@@ -259,6 +259,13 @@ bool Invalid(float3 c)
 // invalid too, and come out as a black disc.
 static const float SourceLimit = 10000.0;
 
+// Above PQ's 10000 nits a value is an effect drawn as bright as the format
+// allows, not light: Odyssey draws its hit indicators and lock-on reticle at
+// half float maximum. It is drawn like any other highlight, but left out of
+// the metering, where a thin ring of it would refit the roll-off to a light
+// thousands of times brighter than the sun.
+static const float MeterLimit = 10000.0 / 80.0;
+
 float3 ReadScRgb(float2 uv)
 {
     return tex2Dlod(sTexSource, float4(uv, 0.0, 0.0)).rgb;
@@ -776,8 +783,11 @@ float4 HdrFrame(float2 uv)
 float4 MeterValues(float2 uv)
 {
     float3 c = HdrFrame(uv).rgb;
+    float  hi = max(max(c.r, c.g), c.b);
+    if (hi > MeterLimit)
+        return float4(0.0, log(MeterFloor), 0.0, 0.0);
     float  Y = GetLuminance(c) * 80.0;
-    return float4(max(max(max(c.r, c.g), c.b), 0.0), log(max(Y, MeterFloor)), max(Y, 0.0) / 80.0, 0.0);
+    return float4(max(hi, 0.0), log(max(Y, MeterFloor)), max(Y, 0.0) / 80.0, 0.0);
 }
 
 float4 PS_Meter(VS_OUTPUT input) : SV_Target
