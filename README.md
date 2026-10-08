@@ -185,11 +185,11 @@ Exposure=0.4
 `Enabled=0` switches the tone mapping off and leaves the frame as the game
 drew it, for an effect chain that does its own.
 
-ReShade draws its own overlay for an HDR display, so with the tone mapping on
-it can look washed out or too bright. In ReShade's Settings tab, set Overlay
-color space to SDR in a game whose swap chain is HDR10, or HDR overlay
-brightness to 80 nits in one that is scRGB, then restart the game. The top line
-of the HDR Bridge tab says which the game uses.
+In a game whose swap chain is HDR10, ReShade still draws its own overlay for an
+HDR display, so with the tone mapping on it looks washed out. Set Overlay color
+space to SDR in ReShade's Settings tab and restart the game. In an scRGB game
+leave it on Auto, where it already looks right. The top line of the HDR Bridge
+tab says which the game uses.
 
 ## For developers
 
